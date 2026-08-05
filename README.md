@@ -21,6 +21,11 @@ Home Assistant as entities that can participate in automations or dashboards.
 * Classifies the advertisement payload to determine whether the valve reports
   as an Evb019 (firmware < 600) or Evb034 (firmware ≥ 600) and exposes the model
   via device information and entity state attributes.
+* Polls authenticated EVB019 dashboard data for flow, capacity, cycle state,
+  cycle timing, battery, and other operational sensors.
+* Provides guarded **Regenerate Now** and **Next Regeneration Step** buttons.
+  The integration refreshes valve state before sending the state-dependent
+  command, so only the action valid for the current cycle state is available.
 
 This repository currently focuses on the scaffolding required for discovery and
 entity creation. Additional device metadata, richer entities, diagnostics, and

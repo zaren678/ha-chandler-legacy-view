@@ -41,6 +41,7 @@ from .device_registry import async_update_device_serial_number
 from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
 from .models import ValveAdvertisement, ValveDashboardData
 from .protocol import should_use_classic_password_decode
+from .regeneration import create_regen_now_payload, regeneration_is_active
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -191,6 +192,10 @@ class ValvePasscodeConfiguration:
 
     value: str | None
     is_override: bool
+
+
+class ValveCommandError(RuntimeError):
+    """Raised when a valve command cannot be safely completed."""
 
 
 class ValveConnection:
@@ -648,6 +653,121 @@ class ValveConnection:
 
         async with self._lock:
             await self._async_poll_locked()
+
+    async def async_regenerate(self, *, advance_current_cycle: bool) -> None:
+        """Start regeneration or advance its current step after verifying state."""
+
+        if not self.available:
+            raise ValveCommandError("The valve is not currently available")
+
+        restart_persistent_session = self._persistent_connection_enabled
+        try:
+            async with self._lock:
+                if self._persistent_task_active():
+                    await self._async_stop_persistent_session()
+                await self._async_regenerate_locked(
+                    advance_current_cycle=advance_current_cycle
+                )
+        finally:
+            if restart_persistent_session and not self._unloaded:
+                self._next_connection_time = None
+                self.schedule_poll()
+
+    async def _async_regenerate_locked(
+        self, *, advance_current_cycle: bool
+    ) -> None:
+        """Send a regeneration command while the connection lock is held."""
+
+        advertisement = self._advertisement
+        if advertisement is None:
+            raise ValveCommandError("No Bluetooth advertisement is available")
+        if advertisement.model not in (None, "Evb019"):
+            raise ValveCommandError(
+                f"Regeneration commands are not supported for {advertisement.model}"
+            )
+
+        ble_device = bluetooth.async_ble_device_from_address(
+            self._hass, self._address, connectable=True
+        )
+        if ble_device is None:
+            raise ValveCommandError("The valve is not currently connectable")
+
+        client: BaseBleakClient | None = None
+        try:
+            try:
+                async with asyncio.timeout(CONNECTION_TIMEOUT_SECONDS):
+                    client = await establish_connection(
+                        BleakClientWithServiceCache,
+                        ble_device,
+                        self._address,
+                    )
+            except asyncio.TimeoutError as exc:
+                raise ValveCommandError(
+                    "Timed out while connecting to the valve"
+                ) from exc
+            except BLEAK_RETRY_EXCEPTIONS as exc:
+                raise ValveCommandError(
+                    f"Unable to connect to the valve: {exc}"
+                ) from exc
+            except Exception as exc:  # pragma: no cover - platform-specific BLE errors
+                raise ValveCommandError(
+                    f"Unexpected error while connecting to the valve: {exc}"
+                ) from exc
+
+            if not await self._async_fetch_device_information(client):
+                raise ValveCommandError(
+                    "Could not authenticate and refresh the valve state"
+                )
+
+            dashboard = self._dashboard_data
+            if dashboard is None:
+                raise ValveCommandError("The valve did not report its current state")
+
+            cycle_active = regeneration_is_active(
+                dashboard.regen_active,
+                dashboard.prefill_soak_mode,
+            )
+            if advance_current_cycle and not cycle_active:
+                raise ValveCommandError("The valve is not currently regenerating")
+            if not advance_current_cycle and cycle_active:
+                raise ValveCommandError(
+                    "The valve is already regenerating; use Next Regeneration Step"
+                )
+
+            command_name = (
+                "Next Regeneration Step"
+                if advance_current_cycle
+                else "Regenerate Now"
+            )
+            if not await self._async_send_payload(
+                client,
+                create_regen_now_payload(),
+                command_name=command_name,
+            ):
+                raise ValveCommandError(f"Failed to send {command_name}")
+
+            _LOGGER.info("Sent %s to valve %s", command_name, self._address)
+
+            # The command has already succeeded; a refresh failure must not turn
+            # this into a false negative that encourages a duplicate command.
+            try:
+                await asyncio.sleep(0.25)
+                _, refreshed = await self._async_request_dashboard(client)
+                if refreshed:
+                    self._last_success = dt_util.utcnow()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover - best-effort refresh
+                _LOGGER.debug(
+                    "Unable to refresh valve %s after %s: %s",
+                    self._address,
+                    command_name,
+                    exc,
+                )
+        finally:
+            if client is not None:
+                await self._async_disconnect_client(client)
+            self._set_connection_cooldown()
 
     async def _async_poll_locked(self) -> None:
         """Perform a Bluetooth connection cycle for the valve."""

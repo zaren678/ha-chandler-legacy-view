@@ -32,6 +32,7 @@ from .dashboard import format_time_of_day
 from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
 from .entity import ChandlerValveEntity, _is_clack_valve
 from .models import ValveAdvertisement, ValveDashboardData
+from .regeneration import regeneration_is_active
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -356,7 +357,9 @@ class ValveCycleRemainingSensor(ValveDashboardSensor):
         if dashboard is None:
             return None
         return cycle_remaining_seconds(
-            dashboard.regen_active,
+            regeneration_is_active(
+                dashboard.regen_active, dashboard.prefill_soak_mode
+            ),
             dashboard.pos_time,
             dashboard.pos_option_seconds,
         )
@@ -392,7 +395,12 @@ class ValveCycleStateSensor(ValveDashboardSensor):
     def _extract_native_value(self, dashboard: ValveDashboardData | None) -> str | None:
         if dashboard is None:
             return None
-        return cycle_phase(dashboard.regen_active, dashboard.regen_cycle_position)
+        return cycle_phase(
+            regeneration_is_active(
+                dashboard.regen_active, dashboard.prefill_soak_mode
+            ),
+            dashboard.regen_cycle_position,
+        )
 
     @property
     def extra_state_attributes(self) -> dict[str, int | bool]:
@@ -402,10 +410,16 @@ class ValveCycleStateSensor(ValveDashboardSensor):
         if dashboard is None:
             return {}
         return {
-            "active": bool(dashboard.regen_active),
+            "active": regeneration_is_active(
+                dashboard.regen_active, dashboard.prefill_soak_mode
+            ),
+            "regen_active_raw": dashboard.regen_active,
+            "prefill_soak_mode": dashboard.prefill_soak_mode,
             "position": dashboard.regen_cycle_position,
             "remaining_seconds": cycle_remaining_seconds(
-                dashboard.regen_active,
+                regeneration_is_active(
+                    dashboard.regen_active, dashboard.prefill_soak_mode
+                ),
                 dashboard.pos_time,
                 dashboard.pos_option_seconds,
             ),
