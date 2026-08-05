@@ -24,11 +24,11 @@ from homeassistant.const import (
 WATER_HARDNESS_GRAINS_PER_GALLON = "grains_per_gallon"
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.util import dt as dt_util
 
 from .const import DATA_CONNECTION_MANAGER, DATA_DISCOVERY_MANAGER, DOMAIN
 from .connection import ValveConnection, ValveConnectionManager
-from .cycle import cycle_phase
+from .cycle import cycle_phase, cycle_remaining_seconds
+from .dashboard import format_time_of_day
 from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
 from .entity import ChandlerValveEntity, _is_clack_valve
 from .models import ValveAdvertisement, ValveDashboardData
@@ -179,9 +179,7 @@ class ValveWaterHardnessSensor(ValveDashboardSensor):
 
 
 class ValveTimeOfDaySensor(ValveDashboardSensor):
-    """Represent the current valve time reported by the dashboard."""
-
-    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    """Represent the valve's local clock as a literal time value."""
 
     def __init__(
         self, advertisement: ValveAdvertisement, connection: ValveConnection
@@ -195,26 +193,12 @@ class ValveTimeOfDaySensor(ValveDashboardSensor):
 
     def _extract_native_value(
         self, dashboard: ValveDashboardData | None
-    ) -> object | None:
+    ) -> str | None:
         if dashboard is None:
             return None
-        hour_value = dashboard.time_hour
-        minute = dashboard.time_minute
-        if hour_value < 0 or minute < 0 or minute >= 60:
-            return None
-
-        hour = hour_value % 24
-        if dashboard.is_pm:
-            if hour < 12:
-                hour = (hour % 12) + 12
-        elif hour == 12:
-            hour = 0
-
-        try:
-            now = dt_util.now()
-            return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        except ValueError:
-            return None
+        return format_time_of_day(
+            dashboard.time_hour, dashboard.time_minute, dashboard.is_pm
+        )
 
 
 class ValveBatteryCapacitySensor(ValveDashboardSensor):
@@ -343,6 +327,39 @@ class ValvePeakFlowTodaySensor(ValveDashboardSensor):
         return dashboard.peak_flow
 
 
+class ValveCycleRemainingSensor(ValveDashboardSensor):
+    """Represent seconds remaining in the current cycle phase."""
+
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_native_unit_of_measurement = UnitOfTime.SECONDS
+
+    def __init__(
+        self, advertisement: ValveAdvertisement, connection: ValveConnection
+    ) -> None:
+        super().__init__(
+            advertisement,
+            connection,
+            unique_id_suffix="cycle_remaining",
+            name_suffix=None,
+        )
+
+    def _get_name_suffix(self, advertisement: ValveAdvertisement) -> str | None:
+        if advertisement.is_metered_softener or (
+            advertisement.valve_type == "TimeClockSoftener"
+        ):
+            return "Regeneration Remaining"
+        return "Backwash Remaining"
+
+    def _extract_native_value(
+        self, dashboard: ValveDashboardData | None
+    ) -> int | None:
+        if dashboard is None:
+            return None
+        return cycle_remaining_seconds(
+            dashboard.regen_active, dashboard.pos_option_seconds
+        )
+
+
 class ValveCycleStateSensor(ValveDashboardSensor):
     """Represent the current regeneration or backwash cycle phase."""
 
@@ -410,6 +427,7 @@ async def async_setup_entry(
     usage_entities: dict[str, ValveWaterUsageTodaySensor] = {}
     peak_entities: dict[str, ValvePeakFlowTodaySensor] = {}
     cycle_entities: dict[str, ValveCycleStateSensor] = {}
+    remaining_entities: dict[str, ValveCycleRemainingSensor] = {}
 
     def _ensure_dashboard_entity(
         advertisement: ValveAdvertisement,
@@ -535,6 +553,16 @@ async def async_setup_entry(
             debug_description="cycle state",
         )
 
+    def _ensure_remaining_entity(
+        advertisement: ValveAdvertisement,
+    ) -> tuple[ValveDashboardSensor | None, list[ValveDashboardSensor]]:
+        return _ensure_dashboard_entity(
+            advertisement,
+            remaining_entities,
+            factory=lambda adv, conn: ValveCycleRemainingSensor(adv, conn),
+            debug_description="cycle remaining",
+        )
+
     EnsureCallback = Callable[
         [ValveAdvertisement],
         tuple[ValveDashboardSensor | None, list[ValveDashboardSensor]],
@@ -550,6 +578,7 @@ async def async_setup_entry(
         _ensure_usage_entity,
         _ensure_peak_entity,
         _ensure_cycle_entity,
+        _ensure_remaining_entity,
     )
 
     initial_entities: list[SensorEntity] = []
@@ -571,6 +600,7 @@ async def async_setup_entry(
         usage_entities,
         peak_entities,
         cycle_entities,
+        remaining_entities,
     )
 
     @callback
