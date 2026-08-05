@@ -19,6 +19,7 @@ from homeassistant.core import CALLBACK_TYPE, HomeAssistant
 from .const import CSI_MANUFACTURER_ID, VALVE_MATCHERS, VALVE_NAME_PREFIXES
 from .device_registry import async_update_device_sw_version
 from .entity import _is_clack_valve, format_firmware_version
+from .firmware import decode_firmware_version, firmware_model
 from .models import ValveAdvertisement
 
 _LOGGER = logging.getLogger(__name__)
@@ -163,16 +164,6 @@ def _flatten_manufacturer_data(value: Any) -> bytes | None:
         return bytes(value)
     except (TypeError, ValueError):
         return None
-
-
-def _decode_firmware_number(value: int) -> int:
-    """Decode Chandler's unusual firmware byte representation."""
-
-    formatted = f"{value:02X}"
-    try:
-        return int(formatted)
-    except ValueError:
-        return value & 0xFF
 
 
 @dataclass(slots=True)
@@ -381,18 +372,10 @@ def _classify_manufacturer_data(
         )
         return _ManufacturerClassification(True)
 
-    firmware_major_raw = payload[-2]
-    firmware_minor_raw = payload[-1]
-
-    firmware_major = _decode_firmware_number(firmware_major_raw)
-    firmware_minor_converted = _decode_firmware_number(firmware_minor_raw)
-    firmware_minor = 99 if firmware_minor_converted >= 250 else firmware_minor_converted
-    firmware_version = firmware_major * 100 + firmware_minor
-    model: str | None
-    if firmware_version >= 600:
-        model = "Evb034"
-    else:
-        model = "Evb019"
+    firmware_major, firmware_minor, firmware_version = decode_firmware_version(
+        payload[-2], payload[-1]
+    )
+    model = firmware_model(firmware_version)
 
     classification = _ManufacturerClassification(
         True,
