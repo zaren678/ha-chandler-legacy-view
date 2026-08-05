@@ -37,10 +37,14 @@ class ValvePersistentPollIntervalNumber(ChandlerValveEntity, NumberEntity):
     _attr_native_step = 1.0
 
     def __init__(
-        self, advertisement: ValveAdvertisement, connection: ValveConnection
+        self,
+        advertisement: ValveAdvertisement,
+        connection: ValveConnection,
+        connection_manager: ValveConnectionManager,
     ) -> None:
         super().__init__(advertisement)
         self._connection = connection
+        self._connection_manager = connection_manager
         self._attr_unique_id = f"{advertisement.address}_persistent_poll_interval"
         self._attr_name = f"{self._attr_name} Persistent Poll Interval"
         self._attr_available = True
@@ -73,8 +77,11 @@ class ValvePersistentPollIntervalNumber(ChandlerValveEntity, NumberEntity):
     async def async_set_native_value(self, value: float) -> None:
         """Update the configured persistent polling interval."""
 
-        await self._connection.async_set_persistent_poll_interval(value)
-        self._attr_native_value = self._connection.persistent_poll_interval
+        self._attr_native_value = (
+            await self._connection_manager.async_set_persistent_poll_interval(
+                self._connection.address, value
+            )
+        )
         if self.hass is not None:
             self.async_write_ha_state()
 
@@ -107,7 +114,9 @@ async def async_setup_entry(
                 )
                 return None, new_entities
 
-            entity = ValvePersistentPollIntervalNumber(advertisement, connection)
+            entity = ValvePersistentPollIntervalNumber(
+                advertisement, connection, connection_manager
+            )
             entities[advertisement.address] = entity
             new_entities.append(entity)
 

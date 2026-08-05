@@ -12,6 +12,7 @@ CONF_DEFAULT_PASSCODE: Final = "default_passcode"
 CONF_DEVICE_ADDRESS: Final = "device_address"
 CONF_DEVICE_PASSCODE: Final = "device_passcode"
 CONF_DEVICE_PASSCODES: Final = "device_passcodes"
+CONF_DEVICE_POLL_INTERVALS: Final = "device_poll_intervals"
 CONF_REMOVE_OVERRIDE: Final = "remove_override"
 
 DEFAULT_VALVE_PASSCODE: Final = "1234"

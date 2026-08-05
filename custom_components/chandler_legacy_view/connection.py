@@ -29,17 +29,20 @@ from homeassistant.util import dt as dt_util
 from .const import (
     CONF_DEFAULT_PASSCODE,
     CONF_DEVICE_PASSCODES,
+    CONF_DEVICE_POLL_INTERVALS,
     CONNECTION_MIN_RETRY_INTERVAL,
     CONNECTION_POLL_INTERVAL,
     CONNECTION_TIMEOUT_SECONDS,
-    DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS,
     DEFAULT_VALVE_PASSCODE,
-    MAX_PERSISTENT_POLL_INTERVAL_SECONDS,
-    MIN_PERSISTENT_POLL_INTERVAL_SECONDS,
 )
 from .device_registry import async_update_device_serial_number
 from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
 from .models import ValveAdvertisement, ValveDashboardData
+from .polling import (
+    normalize_persistent_poll_interval,
+    persistent_poll_interval_for_address,
+    updated_persistent_poll_intervals,
+)
 from .protocol import should_use_classic_password_decode
 from .regeneration import create_regen_now_payload, regeneration_is_active
 
@@ -206,6 +209,7 @@ class ValveConnection:
         hass: HomeAssistant,
         address: str,
         passcode_getter: Callable[[str], ValvePasscodeConfiguration] | None = None,
+        persistent_poll_interval: object = None,
     ) -> None:
         """Initialize the valve connection handler."""
 
@@ -235,7 +239,9 @@ class ValveConnection:
         self._passcode_getter = passcode_getter
         self._crc8 = _ChandlerCrc8()
         self._persistent_connection_enabled = False
-        self._persistent_poll_interval = DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS
+        self._persistent_poll_interval = normalize_persistent_poll_interval(
+            persistent_poll_interval
+        )
         self._persistent_task: asyncio.Task[None] | None = None
 
     @property
@@ -359,15 +365,7 @@ class ValveConnection:
     async def async_set_persistent_poll_interval(self, seconds: float) -> None:
         """Update the poll interval used during persistent connections."""
 
-        try:
-            value = float(seconds)
-        except (TypeError, ValueError):
-            value = DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS
-
-        value = max(
-            MIN_PERSISTENT_POLL_INTERVAL_SECONDS,
-            min(value, MAX_PERSISTENT_POLL_INTERVAL_SECONDS),
-        )
+        value = normalize_persistent_poll_interval(seconds)
 
         if self._persistent_poll_interval == value:
             return
@@ -549,12 +547,8 @@ class ValveConnection:
                 ):
                     break
 
-                interval = max(
-                    MIN_PERSISTENT_POLL_INTERVAL_SECONDS,
-                    min(
-                        self._persistent_poll_interval,
-                        MAX_PERSISTENT_POLL_INTERVAL_SECONDS,
-                    ),
+                interval = normalize_persistent_poll_interval(
+                    self._persistent_poll_interval
                 )
 
                 _LOGGER.debug(
@@ -2421,6 +2415,7 @@ class ValveConnectionManager:
                 self._hass,
                 advertisement.address,
                 self.get_passcode,
+                self.get_persistent_poll_interval(advertisement.address),
             )
             self._connections[advertisement.address] = connection
         connection.update_from_advertisement(advertisement)
@@ -2435,6 +2430,39 @@ class ValveConnectionManager:
         """Return the connection for a specific valve address, if available."""
 
         return self._connections.get(address)
+
+    def get_persistent_poll_interval(self, address: str) -> float:
+        """Return the persisted polling interval for a valve."""
+
+        return persistent_poll_interval_for_address(
+            self._config_entry.options.get(CONF_DEVICE_POLL_INTERVALS),
+            address,
+        )
+
+    async def async_set_persistent_poll_interval(
+        self, address: str, seconds: float
+    ) -> float:
+        """Apply and persist the polling interval for a valve."""
+
+        connection = self.get_connection(address)
+        if connection is None:
+            raise ValueError(f"Unknown valve address: {address}")
+
+        await connection.async_set_persistent_poll_interval(seconds)
+        value = connection.persistent_poll_interval
+        intervals = updated_persistent_poll_intervals(
+            self._config_entry.options.get(CONF_DEVICE_POLL_INTERVALS),
+            address,
+            value,
+        )
+        self._hass.config_entries.async_update_entry(
+            self._config_entry,
+            options={
+                **self._config_entry.options,
+                CONF_DEVICE_POLL_INTERVALS: intervals,
+            },
+        )
+        return value
 
     def get_passcode(
         self, address: str | None = None
