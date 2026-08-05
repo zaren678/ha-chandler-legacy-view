@@ -398,6 +398,9 @@ def _classify_manufacturer_data(
     else:
         _parse_evb019_payload(payload, classification)
 
+    if not classification.manufacturer_data_complete:
+        return _ManufacturerClassification(True, manufacturer_data_complete=False)
+
     return classification
 
 

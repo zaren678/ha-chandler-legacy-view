@@ -40,6 +40,7 @@ from .const import (
 from .device_registry import async_update_device_serial_number
 from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
 from .models import ValveAdvertisement, ValveDashboardData
+from .protocol import should_use_classic_password_decode
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -718,15 +719,18 @@ class ValveConnection:
             cleanup_client = client
 
             try:
-                await self._async_fetch_device_information(client)
+                dashboard_response_received = (
+                    await self._async_fetch_device_information(client)
+                )
             except Exception:  # pragma: no cover - future protocol work may raise
                 _LOGGER.exception(
                     "Error while retrieving extended data from valve %s", self._address
                 )
             else:
-                self._last_success = dt_util.utcnow()
-                if self._try_begin_persistent_session(client):
-                    cleanup_client = None
+                if dashboard_response_received:
+                    self._last_success = dt_util.utcnow()
+                    if self._try_begin_persistent_session(client):
+                        cleanup_client = None
             finally:
                 if cleanup_client is not None:
                     await self._async_disconnect_client(cleanup_client)
@@ -736,12 +740,12 @@ class ValveConnection:
 
     async def _async_fetch_device_information(
         self, client: BaseBleakClient
-    ) -> None:
-        """Retrieve extended diagnostic information from the valve."""
+    ) -> bool:
+        """Retrieve data and report whether Dashboard returned a response."""
 
         advertisement = self._advertisement
         if advertisement is None:
-            return
+            return False
 
         model = advertisement.model
         manufacturer_data_complete = advertisement.manufacturer_data_complete
@@ -752,7 +756,7 @@ class ValveConnection:
                 self._address,
                 model or "unknown model",
             )
-            return
+            return False
 
         if model is None and not manufacturer_data_complete:
             _LOGGER.debug(
@@ -766,25 +770,29 @@ class ValveConnection:
                 "Unable to send DeviceList request to valve %s; will retry on next poll",
                 self._address,
             )
-            return
+            return False
 
-        if response_received:
-            _LOGGER.debug(
-                "Retrieved DeviceList response from valve %s during diagnostic poll",
-                self._address,
-            )
-        else:
+        if not response_received:
             _LOGGER.debug(
                 "Valve %s did not provide a DeviceList response during this poll",
                 self._address,
             )
+            return False
+
+        _LOGGER.debug(
+            "Retrieved DeviceList response from valve %s during diagnostic poll",
+            self._address,
+        )
 
         authenticated = (
             self._device_list_authentication_state
             == ValveAuthenticationState.AUTHENTICATED
         )
 
-        if self._advertisement.authentication_required and not authenticated:
+        authentication_required = (
+            self._device_list_password_state == ValvePasswordDecodeState.AUTH_NEEDED
+        )
+        if authentication_required and not authenticated:
             passcode = self.get_configured_passcode()
             if passcode is not None:
                 passcode = passcode.strip()
@@ -795,7 +803,7 @@ class ValveConnection:
                     "Skipping Dashboard request to valve %s; authentication is required and no passcode is configured",
                     self._address,
                 )
-                return
+                return False
 
             if self._authentication_failed and (
                 passcode == self._authentication_failed_passcode
@@ -804,7 +812,7 @@ class ValveConnection:
                     "Skipping Dashboard request to valve %s; authentication was previously attempted and failed",
                     self._address,
                 )
-                return
+                return False
 
             if self._parse_passcode(passcode) is None:
                 _LOGGER.debug(
@@ -812,20 +820,20 @@ class ValveConnection:
                     self._address,
                     passcode,
                 )
-                return
+                return False
 
             if self._device_list_password_state == ValvePasswordDecodeState.AUTH_NEEDED:
                 _LOGGER.debug(
                     "Skipping Dashboard request to valve %s; valve still reports that authentication is required",
                     self._address,
                 )
-                return
+                return False
 
             _LOGGER.debug(
                 "Skipping Dashboard request to valve %s; authentication has not been confirmed",
                 self._address,
             )
-            return
+            return False
 
         dashboard_request_sent, dashboard_response_received = (
             await self._async_request_dashboard(client)
@@ -835,7 +843,7 @@ class ValveConnection:
                 "Unable to send Dashboard request to valve %s; will retry on next poll",
                 self._address,
             )
-            return
+            return False
 
         if dashboard_response_received:
             _LOGGER.debug(
@@ -847,6 +855,8 @@ class ValveConnection:
                 "Valve %s did not provide a Dashboard response during this poll",
                 self._address,
             )
+
+        return dashboard_response_received
 
     @staticmethod
     def _create_request_payload(request: ValveRequestCommand | int) -> bytes:
@@ -2043,12 +2053,12 @@ class ValveConnection:
         )
         is_twin_valve = bool(self._device_list_is_twin_valve)
 
-        use_classic_decode = False
-        if not is_twin_valve:
-            if firmware_version is not None:
-                use_classic_decode = firmware_version < 420 and firmware_version != 419
-            else:
-                use_classic_decode = not has_connection_counter
+        use_classic_decode = should_use_classic_password_decode(
+            status=status,
+            is_twin_valve=is_twin_valve,
+            firmware_version=firmware_version,
+            has_connection_counter=has_connection_counter,
+        )
 
         if use_classic_decode:
             if len(packet) <= 11:
