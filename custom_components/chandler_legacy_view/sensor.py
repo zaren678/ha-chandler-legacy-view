@@ -28,6 +28,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import DATA_CONNECTION_MANAGER, DATA_DISCOVERY_MANAGER, DOMAIN
 from .connection import ValveConnection, ValveConnectionManager
+from .cycle import cycle_phase
 from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
 from .entity import ChandlerValveEntity, _is_clack_valve
 from .models import ValveAdvertisement, ValveDashboardData
@@ -342,6 +343,53 @@ class ValvePeakFlowTodaySensor(ValveDashboardSensor):
         return dashboard.peak_flow
 
 
+class ValveCycleStateSensor(ValveDashboardSensor):
+    """Represent the current regeneration or backwash cycle phase."""
+
+    def __init__(
+        self, advertisement: ValveAdvertisement, connection: ValveConnection
+    ) -> None:
+        self._dashboard: ValveDashboardData | None = None
+        super().__init__(
+            advertisement,
+            connection,
+            unique_id_suffix="cycle_state",
+            name_suffix=None,
+        )
+
+    def _get_name_suffix(self, advertisement: ValveAdvertisement) -> str | None:
+        if advertisement.is_metered_softener or (
+            advertisement.valve_type == "TimeClockSoftener"
+        ):
+            return "Regeneration State"
+        return "Backwash State"
+
+    def _update_from_dashboard(
+        self, dashboard: ValveDashboardData | None, *, write_state: bool
+    ) -> None:
+        self._dashboard = dashboard
+        super()._update_from_dashboard(dashboard, write_state=write_state)
+
+    def _extract_native_value(self, dashboard: ValveDashboardData | None) -> str | None:
+        if dashboard is None:
+            return None
+        return cycle_phase(dashboard.regen_active, dashboard.regen_cycle_position)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, int | bool]:
+        """Expose raw cycle state and timing for diagnostics and automations."""
+
+        dashboard = self._dashboard
+        if dashboard is None:
+            return {}
+        return {
+            "active": bool(dashboard.regen_active),
+            "position": dashboard.regen_cycle_position,
+            "remaining_seconds": dashboard.pos_option_seconds,
+            "position_time": dashboard.pos_time,
+        }
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -361,6 +409,7 @@ async def async_setup_entry(
     days_entities: dict[str, ValveDaysUntilRegenerationSensor] = {}
     usage_entities: dict[str, ValveWaterUsageTodaySensor] = {}
     peak_entities: dict[str, ValvePeakFlowTodaySensor] = {}
+    cycle_entities: dict[str, ValveCycleStateSensor] = {}
 
     def _ensure_dashboard_entity(
         advertisement: ValveAdvertisement,
@@ -476,6 +525,16 @@ async def async_setup_entry(
             debug_description="peak flow today",
         )
 
+    def _ensure_cycle_entity(
+        advertisement: ValveAdvertisement,
+    ) -> tuple[ValveDashboardSensor | None, list[ValveDashboardSensor]]:
+        return _ensure_dashboard_entity(
+            advertisement,
+            cycle_entities,
+            factory=lambda adv, conn: ValveCycleStateSensor(adv, conn),
+            debug_description="cycle state",
+        )
+
     EnsureCallback = Callable[
         [ValveAdvertisement],
         tuple[ValveDashboardSensor | None, list[ValveDashboardSensor]],
@@ -490,6 +549,7 @@ async def async_setup_entry(
         _ensure_days_entity,
         _ensure_usage_entity,
         _ensure_peak_entity,
+        _ensure_cycle_entity,
     )
 
     initial_entities: list[SensorEntity] = []
@@ -510,6 +570,7 @@ async def async_setup_entry(
         days_entities,
         usage_entities,
         peak_entities,
+        cycle_entities,
     )
 
     @callback
