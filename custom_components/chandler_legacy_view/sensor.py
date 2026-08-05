@@ -409,8 +409,8 @@ class ValveCycleStateSensor(ValveDashboardSensor):
                 dashboard.pos_time,
                 dashboard.pos_option_seconds,
             ),
-            "remaining_minutes_raw": dashboard.pos_time,
-            "remaining_seconds_raw": dashboard.pos_option_seconds,
+            "remaining_time_raw": dashboard.pos_time,
+            "seconds_mode_raw": dashboard.pos_option_seconds,
             "position_time": dashboard.pos_time,
         }
 

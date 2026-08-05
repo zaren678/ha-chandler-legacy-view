@@ -43,9 +43,13 @@ class CyclePhaseTests(unittest.TestCase):
     def test_unknown_active_position_remains_visible(self) -> None:
         self.assertEqual("Position 7", _CYCLE.cycle_phase(1, 7))
 
-    def test_cycle_remaining_seconds(self) -> None:
-        self.assertEqual(180, _CYCLE.cycle_remaining_seconds(1, 3, 0))
-        self.assertEqual(16, _CYCLE.cycle_remaining_seconds(1, 0, 16))
-        self.assertEqual(16, _CYCLE.cycle_remaining_seconds(1, 0x7F, 16))
-        self.assertEqual(0, _CYCLE.cycle_remaining_seconds(0, 3, 16))
-        self.assertEqual(0, _CYCLE.cycle_remaining_seconds(1, -1, -1))
+    def test_cycle_remaining_minutes(self) -> None:
+        self.assertEqual(180, _CYCLE.cycle_remaining_seconds(1, 0x03, 0x00))
+        self.assertEqual(120, _CYCLE.cycle_remaining_seconds(1, 0x02, 0x00))
+
+    def test_cycle_remaining_seconds_mode(self) -> None:
+        self.assertEqual(56, _CYCLE.cycle_remaining_seconds(1, 0x56, 0x10))
+        self.assertEqual(0, _CYCLE.cycle_remaining_seconds(0, 0x56, 0x10))
+
+    def test_unknown_time_encoding_is_preserved(self) -> None:
+        self.assertEqual(127, _CYCLE.cycle_remaining_seconds(1, 0x7F, 0x10))
