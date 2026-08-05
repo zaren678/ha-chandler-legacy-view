@@ -25,8 +25,20 @@ class CyclePhaseTests(unittest.TestCase):
     def test_inactive_cycle_is_idle(self) -> None:
         self.assertEqual("Idle", _CYCLE.cycle_phase(0, 2))
 
-    def test_position_two_is_decompress(self) -> None:
-        self.assertEqual("Decompress (2)", _CYCLE.cycle_phase(1, 2))
+    def test_position_one_is_decompress(self) -> None:
+        self.assertEqual("Decompress (1)", _CYCLE.cycle_phase(1, 1))
+
+    def test_position_two_is_air_release(self) -> None:
+        self.assertEqual("Air Release (2)", _CYCLE.cycle_phase(1, 2))
+
+    def test_position_three_is_backwash(self) -> None:
+        self.assertEqual("Backwash (3)", _CYCLE.cycle_phase(1, 3))
+
+    def test_position_five_is_air_draw(self) -> None:
+        self.assertEqual("Air Draw (5)", _CYCLE.cycle_phase(1, 5))
+
+    def test_position_six_is_rapid_rinse(self) -> None:
+        self.assertEqual("Rapid Rinse (6)", _CYCLE.cycle_phase(1, 6))
 
     def test_unknown_active_position_remains_visible(self) -> None:
         self.assertEqual("Position 7", _CYCLE.cycle_phase(1, 7))

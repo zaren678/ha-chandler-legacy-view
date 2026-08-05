@@ -4,7 +4,11 @@ from __future__ import annotations
 
 
 _CYCLE_PHASES = {
-    2: "Decompress (2)",
+    1: "Decompress (1)",
+    2: "Air Release (2)",
+    3: "Backwash (3)",
+    5: "Air Draw (5)",
+    6: "Rapid Rinse (6)",
 }
 
 
