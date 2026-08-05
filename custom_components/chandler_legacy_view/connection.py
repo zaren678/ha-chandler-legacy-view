@@ -557,6 +557,11 @@ class ValveConnection:
                     ),
                 )
 
+                _LOGGER.debug(
+                    "Persistent connection for valve %s will refresh in %.1f seconds",
+                    self._address,
+                    interval,
+                )
                 try:
                     await asyncio.sleep(interval)
                 except asyncio.CancelledError:

@@ -26,9 +26,10 @@ PLATFORMS: Final[list[Platform]] = [
 ]
 
 # Persistent connection configuration
-DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS: Final = 10.0
-MIN_PERSISTENT_POLL_INTERVAL_SECONDS: Final = 5.0
-MAX_PERSISTENT_POLL_INTERVAL_SECONDS: Final = 300.0
+# EVB019 closes an authenticated BLE connection after roughly five idle seconds.
+DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS: Final = 4.0
+MIN_PERSISTENT_POLL_INTERVAL_SECONDS: Final = 1.0
+MAX_PERSISTENT_POLL_INTERVAL_SECONDS: Final = 4.0
 
 # Storage keys used inside ``hass.data``
 DATA_DISCOVERY_MANAGER: Final = "discovery_manager"

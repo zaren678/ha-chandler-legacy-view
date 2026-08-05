@@ -27,6 +27,9 @@ Home Assistant as entities that can participate in automations or dashboards.
   **Next Regeneration Step** buttons. The integration refreshes valve state
   before sending the state-dependent command, so only the action valid for the
   current cycle state is available.
+* Supports persistent dashboard polling every one to four seconds. EVB019
+  valves disconnect after approximately five idle seconds, so longer intervals
+  cannot keep a BLE session open reliably.
 
 This repository currently focuses on the scaffolding required for discovery and
 entity creation. Additional device metadata, richer entities, diagnostics, and
