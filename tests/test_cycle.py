@@ -48,7 +48,9 @@ class CyclePhaseTests(unittest.TestCase):
         self.assertEqual(120, _CYCLE.cycle_remaining_seconds(1, 0x02, 0x00))
 
     def test_cycle_remaining_seconds_mode(self) -> None:
-        self.assertEqual(56, _CYCLE.cycle_remaining_seconds(1, 0x56, 0x10))
+        self.assertEqual(86, _CYCLE.cycle_remaining_seconds(1, 0x56, 0x10))
+        self.assertEqual(80, _CYCLE.cycle_remaining_seconds(1, 0x50, 0x10))
+        self.assertEqual(79, _CYCLE.cycle_remaining_seconds(1, 0x4F, 0x10))
         self.assertEqual(0, _CYCLE.cycle_remaining_seconds(0, 0x56, 0x10))
 
     def test_motor_transition_has_no_countdown(self) -> None:

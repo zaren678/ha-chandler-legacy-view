@@ -21,16 +21,6 @@ def cycle_phase(regen_active: int, position: int) -> str:
     return _CYCLE_PHASES.get(position, f"Position {position}")
 
 
-def decode_bcd_time(value: int) -> int:
-    """Decode a packed BCD time value, preserving unknown encodings."""
-
-    normalized = value & 0xFF
-    high, low = divmod(normalized, 16)
-    if high < 10 and low < 10:
-        return high * 10 + low
-    return normalized
-
-
 def cycle_remaining_seconds(
     regen_active: int, raw_time: int, seconds_mode: int
 ) -> int | None:
@@ -39,7 +29,9 @@ def cycle_remaining_seconds(
     if not regen_active:
         return 0
 
-    remaining = decode_bcd_time(raw_time)
+    # Legacy View reads this field as a signed byte and presents its
+    # nonnegative values directly; the wire value is not packed BCD.
+    remaining = raw_time & 0xFF
     if remaining > 100:
         return None
     if seconds_mode:
