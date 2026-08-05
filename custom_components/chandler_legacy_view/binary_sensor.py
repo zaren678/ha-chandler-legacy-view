@@ -23,12 +23,12 @@ from .entity import (
     _can_report_low_salt,
     _is_clack_valve,
     _salt_sensor_status_display,
-    _valve_error_display,
     _valve_series_display,
     _water_status_display,
     format_firmware_version,
 )
 from .models import ValveAdvertisement
+from .valve_error import valve_error_active, valve_error_display
 
 
 class ValvePresenceBinarySensor(ChandlerValveEntity, BinarySensorEntity):
@@ -95,11 +95,15 @@ class ValvePresenceBinarySensor(ChandlerValveEntity, BinarySensorEntity):
             if bypass_display is not None:
                 attributes["bypass_status"] = bypass_display
         if self._advertisement.valve_error is not None:
-            error_display = _valve_error_display(
-                self._advertisement.valve_error, is_clack_valve
+            error_display = valve_error_display(
+                self._advertisement.valve_error,
+                is_clack_valve,
+                self._advertisement.valve_error_raw,
             )
             if error_display is not None:
                 attributes["valve_error"] = error_display
+        if self._advertisement.valve_error_raw is not None:
+            attributes["valve_error_raw"] = self._advertisement.valve_error_raw
         if self._advertisement.valve_time_hours is not None:
             attributes["valve_time_hours"] = self._advertisement.valve_time_hours
         if self._advertisement.valve_time_minutes is not None:
@@ -170,6 +174,66 @@ class ValveBypassBinarySensor(ChandlerValveEntity, BinarySensorEntity):
         bypass_display = _bypass_status_display(self._advertisement.bypass_status)
         if bypass_display is not None:
             attributes["bypass_status"] = bypass_display
+        return attributes
+
+
+class ValveErrorBinarySensor(ChandlerValveEntity, BinarySensorEntity):
+    """Report any decoded or unknown raw valve error as a problem."""
+
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+
+    def __init__(self, advertisement: ValveAdvertisement) -> None:
+        super().__init__(advertisement)
+        self._attr_unique_id = f"{advertisement.address}_valve_error"
+        self._attr_name = f"{self._attr_name} Valve Error"
+        self._attr_available = True
+        self._update_from_advertisement(advertisement)
+
+    def _update_from_advertisement(self, advertisement: ValveAdvertisement) -> None:
+        """Update the problem state from decoded and raw error values."""
+
+        self._attr_is_on = valve_error_active(
+            advertisement.valve_error, advertisement.valve_error_raw
+        )
+
+    def async_update_from_advertisement(
+        self, advertisement: ValveAdvertisement
+    ) -> None:
+        """Store advertisement details and refresh the error state."""
+
+        super().async_update_from_advertisement(advertisement)
+        self._attr_name = f"{self._attr_name} Valve Error"
+        self._update_from_advertisement(advertisement)
+
+    @callback
+    def async_handle_bluetooth_update(
+        self, advertisement: ValveAdvertisement, change: BluetoothChange
+    ) -> None:
+        """Handle updates from Bluetooth discovery."""
+
+        if change in BLUETOOTH_LOST_CHANGES:
+            self._attr_available = False
+        else:
+            self.async_update_from_advertisement(advertisement)
+            self._attr_available = True
+        self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> Mapping[str, int | str]:
+        """Expose official decoded text and raw protocol values."""
+
+        attributes: dict[str, int | str] = {}
+        display = valve_error_display(
+            self._advertisement.valve_error,
+            _is_clack_valve(self._advertisement.name),
+            self._advertisement.valve_error_raw,
+        )
+        if display is not None:
+            attributes["valve_error"] = display
+        if self._advertisement.valve_error is not None:
+            attributes["valve_error_code"] = self._advertisement.valve_error
+        if self._advertisement.valve_error_raw is not None:
+            attributes["valve_error_raw"] = self._advertisement.valve_error_raw
         return attributes
 
 
@@ -264,6 +328,9 @@ async def async_setup_entry(
             "presence", lambda: ValvePresenceBinarySensor(advertisement)
         )
         _get_or_create("bypass", lambda: ValveBypassBinarySensor(advertisement))
+        _get_or_create(
+            "valve_error", lambda: ValveErrorBinarySensor(advertisement)
+        )
 
         if _can_report_low_salt(advertisement.name):
             _get_or_create("salt", lambda: ValveSaltBinarySensor(advertisement))

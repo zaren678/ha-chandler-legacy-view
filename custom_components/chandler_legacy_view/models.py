@@ -34,6 +34,7 @@ class ValveAdvertisement:
     water_status: int | None = None
     bypass_status: int | None = None
     valve_error: int | None = None
+    valve_error_raw: int | None = None
     valve_time_hours: int | None = None
     valve_time_minutes: int | None = None
     valve_type_full: int | None = None

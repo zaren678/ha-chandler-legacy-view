@@ -21,6 +21,7 @@ from .device_registry import async_update_device_sw_version
 from .entity import _is_clack_valve, format_firmware_version
 from .firmware import decode_firmware_version, firmware_model
 from .models import ValveAdvertisement
+from .valve_error import decode_evb019_valve_error
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -112,16 +113,6 @@ _BLUETOOTH_ADVERTISEMENT_CHANGE: BluetoothChange | None = getattr(
     BluetoothChange, "ADVERTISEMENT", None
 )
 
-_EVB019_VALVE_ERROR_MAP: dict[int, int] = {
-    1: 2,
-    2: 3,
-    4: 4,
-    8: 5,
-    16: 6,
-    32: 7,
-}
-
-
 def _matches_valve_prefix(name: str | None) -> bool:
     """Return ``True`` if the Bluetooth local name matches known prefixes."""
 
@@ -185,6 +176,7 @@ class _ManufacturerClassification:
     water_status: int | None = None
     bypass_status: int | None = None
     valve_error: int | None = None
+    valve_error_raw: int | None = None
     valve_time_hours: int | None = None
     valve_time_minutes: int | None = None
     valve_type_full: int | None = None
@@ -440,6 +432,7 @@ def _parse_evb034_payload(
     valve_status = payload[2]
     _apply_valve_status(classification, valve_status)
     classification.valve_error = payload[3]
+    classification.valve_error_raw = payload[3]
     classification.valve_time_hours = payload[4]
     classification.valve_time_minutes = payload[5]
     classification.valve_type_full = payload[6]
@@ -477,7 +470,8 @@ def _parse_evb019_payload(
     valve_status = payload[2]
     _apply_valve_status(classification, valve_status)
     raw_valve_error = payload[3]
-    classification.valve_error = _EVB019_VALVE_ERROR_MAP.get(raw_valve_error, 0)
+    classification.valve_error_raw = raw_valve_error
+    classification.valve_error = decode_evb019_valve_error(raw_valve_error)
     classification.valve_time_hours = payload[4]
     classification.valve_time_minutes = payload[5]
 
@@ -675,6 +669,7 @@ class ValveDiscoveryManager:
                 bypass_status=classification.bypass_status,
                 authentication_required=classification.authentication_required,
                 valve_error=classification.valve_error,
+                valve_error_raw=classification.valve_error_raw,
                 valve_time_hours=classification.valve_time_hours,
                 valve_time_minutes=classification.valve_time_minutes,
                 valve_type_full=classification.valve_type_full,

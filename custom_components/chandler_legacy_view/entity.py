@@ -30,18 +30,6 @@ _LOW_SALT_CAPABLE_NAMES = {
     "CL_06",
     "CL_08",
 }
-_VALVE_ERROR_TIMEOUT_CODE = 7
-
-_VALVE_ERROR_DISPLAY: dict[int, str] = {
-    0: "No Error",
-    2: "Lost home, but looking for home",
-    3: "Not seeing slots, normal motor current",
-    4: "Lost home, can't find it after looking",
-    5: "Not seeing slots, high motor current",
-    6: "Not seeing slots, no motor current",
-    192: "Regen aborted, can't start a regen while on battery",
-}
-
 _VALVE_TYPE_DISPLAY: dict[int, str] = {
     0: "Unknown",
     254: "Commercial test valve",
@@ -120,16 +108,6 @@ def _can_report_low_salt(advertised_name: str | None) -> bool:
         return False
 
     return normalized_name in _LOW_SALT_CAPABLE_NAMES
-
-
-def _valve_error_display(error_code: int | None, is_clack_valve: bool) -> str | None:
-    """Return the display string for a valve error enumeration value."""
-
-    if error_code is None:
-        return None
-    if error_code == _VALVE_ERROR_TIMEOUT_CODE:
-        return "Drive 1 motor timeout error" if is_clack_valve else "TWEDO motor timeout error"
-    return _VALVE_ERROR_DISPLAY.get(error_code)
 
 
 def _valve_type_display(valve_type: int | None) -> str | None:

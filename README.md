@@ -16,6 +16,8 @@ Home Assistant as entities that can participate in automations or dashboards.
   device is registered individually in Home Assistant.
 * Creates binary sensor entities that indicate whether each recognised valve is
   currently available.
+* Creates a dedicated Valve Error problem sensor from the official app's error
+  mapping, while retaining unknown nonzero raw codes so automations fail safe.
 * Extracts the firmware version reported in the advertisement metadata and
   surfaces it as an entity attribute for troubleshooting and diagnostics.
 * Classifies the advertisement payload to determine whether the valve reports
@@ -27,9 +29,10 @@ Home Assistant as entities that can participate in automations or dashboards.
   **Next Regeneration Step** buttons. The integration refreshes valve state
   before sending the state-dependent command, so only the action valid for the
   current cycle state is available.
-* Supports persistent dashboard polling every one to four seconds. EVB019
-  valves disconnect after approximately five idle seconds, so longer intervals
-  cannot keep a BLE session open reliably.
+* Supports persistent dashboard polling every one to four seconds and saves both
+  the interval and enabled state per valve. EVB019 valves disconnect after
+  approximately five idle seconds, so longer intervals cannot keep a BLE
+  session open reliably.
 
 This repository currently focuses on the scaffolding required for discovery and
 entity creation. Additional device metadata, richer entities, diagnostics, and
