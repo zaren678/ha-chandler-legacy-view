@@ -654,6 +654,30 @@ class ValveConnection:
         async with self._lock:
             await self._async_poll_locked()
 
+    async def async_refresh_now(self) -> None:
+        """Immediately refresh authenticated dashboard data."""
+
+        if not self.available:
+            raise ValveCommandError("The valve is not currently available")
+
+        restart_persistent_session = self._persistent_connection_enabled
+        try:
+            async with self._lock:
+                if self._persistent_task_active():
+                    await self._async_stop_persistent_session()
+                self._cancel_cooldown()
+                self._next_connection_time = None
+                if not await self._async_poll_locked():
+                    raise ValveCommandError("The valve did not provide fresh data")
+        finally:
+            if (
+                restart_persistent_session
+                and not self._unloaded
+                and not self._persistent_task_active()
+            ):
+                self._next_connection_time = None
+                self.schedule_poll()
+
     async def async_regenerate(self, *, advance_current_cycle: bool) -> None:
         """Start regeneration or advance its current step after verifying state."""
 
@@ -769,7 +793,7 @@ class ValveConnection:
                 await self._async_disconnect_client(client)
             self._set_connection_cooldown()
 
-    async def _async_poll_locked(self) -> None:
+    async def _async_poll_locked(self) -> bool:
         """Perform a Bluetooth connection cycle for the valve."""
 
         now = dt_util.utcnow()
@@ -782,10 +806,11 @@ class ValveConnection:
                 remaining,
             )
             self._schedule_cooldown_retry(remaining)
-            return
+            return False
 
         connection_attempted = False
         cleanup_client: BaseBleakClient | None = None
+        dashboard_response_received = False
 
         try:
             advertisement = self._advertisement
@@ -793,7 +818,7 @@ class ValveConnection:
                 _LOGGER.debug(
                     "Skipping poll for %s; no advertisement data is available", self._address
                 )
-                return
+                return False
 
             ble_device = bluetooth.async_ble_device_from_address(
                 self._hass, self._address, connectable=True
@@ -802,7 +827,7 @@ class ValveConnection:
                 _LOGGER.debug(
                     "Bluetooth device %s is not currently connectable", self._address
                 )
-                return
+                return False
 
             _LOGGER.debug(
                 "Connecting to valve %s to refresh diagnostic data", self._address
@@ -822,19 +847,19 @@ class ValveConnection:
                 _LOGGER.warning(
                     "Timed out while attempting to connect to valve %s", self._address
                 )
-                return
+                return False
             except BLEAK_RETRY_EXCEPTIONS as exc:
                 _LOGGER.debug(
                     "Unable to establish Bluetooth connection to valve %s: %s",
                     self._address,
                     exc,
                 )
-                return
+                return False
             except Exception:  # pragma: no cover - unexpected errors are logged
                 _LOGGER.exception(
                     "Unexpected error connecting to valve %s", self._address
                 )
-                return
+                return False
 
             cleanup_client = client
 
@@ -857,6 +882,8 @@ class ValveConnection:
         finally:
             if connection_attempted:
                 self._set_connection_cooldown()
+
+        return dashboard_response_received
 
     async def _async_fetch_device_information(
         self, client: BaseBleakClient

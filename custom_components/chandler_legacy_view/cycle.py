@@ -31,13 +31,17 @@ def decode_bcd_time(value: int) -> int:
     return normalized
 
 
-def cycle_remaining_seconds(regen_active: int, raw_time: int, seconds_mode: int) -> int:
-    """Return the current phase countdown, or zero while the cycle is idle."""
+def cycle_remaining_seconds(
+    regen_active: int, raw_time: int, seconds_mode: int
+) -> int | None:
+    """Return the phase countdown, excluding the motor-transition sentinel."""
 
     if not regen_active:
         return 0
 
     remaining = decode_bcd_time(raw_time)
+    if remaining > 100:
+        return None
     if seconds_mode:
         return remaining
     return remaining * 60

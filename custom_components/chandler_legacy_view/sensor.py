@@ -403,7 +403,7 @@ class ValveCycleStateSensor(ValveDashboardSensor):
         )
 
     @property
-    def extra_state_attributes(self) -> dict[str, int | bool]:
+    def extra_state_attributes(self) -> dict[str, int | bool | None]:
         """Expose raw cycle state and timing for diagnostics and automations."""
 
         dashboard = self._dashboard

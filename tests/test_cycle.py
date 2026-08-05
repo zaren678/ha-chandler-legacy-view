@@ -51,5 +51,6 @@ class CyclePhaseTests(unittest.TestCase):
         self.assertEqual(56, _CYCLE.cycle_remaining_seconds(1, 0x56, 0x10))
         self.assertEqual(0, _CYCLE.cycle_remaining_seconds(0, 0x56, 0x10))
 
-    def test_unknown_time_encoding_is_preserved(self) -> None:
-        self.assertEqual(127, _CYCLE.cycle_remaining_seconds(1, 0x7F, 0x10))
+    def test_motor_transition_has_no_countdown(self) -> None:
+        self.assertIsNone(_CYCLE.cycle_remaining_seconds(1, 0x7F, 0x00))
+        self.assertIsNone(_CYCLE.cycle_remaining_seconds(1, 0x7F, 0x10))

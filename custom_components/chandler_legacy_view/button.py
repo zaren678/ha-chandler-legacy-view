@@ -110,23 +110,67 @@ class ValveRegenerationButton(ChandlerValveEntity, ButtonEntity):
             raise HomeAssistantError(str(exc)) from exc
 
 
+class ValveRefreshButton(ChandlerValveEntity, ButtonEntity):
+    """Immediately refresh authenticated valve dashboard data."""
+
+    def __init__(
+        self, advertisement: ValveAdvertisement, connection: ValveConnection
+    ) -> None:
+        super().__init__(advertisement)
+        self._connection = connection
+        self._label = "Refresh Now"
+        self._attr_unique_id = f"{advertisement.address}_refresh_now"
+        self._attr_name = f"{self._attr_name} {self._label}"
+        self._attr_available = True
+
+    def async_update_from_advertisement(
+        self, advertisement: ValveAdvertisement
+    ) -> None:
+        """Store updated discovery data without losing the action name."""
+
+        super().async_update_from_advertisement(advertisement)
+        self._attr_name = f"{self._attr_name} {self._label}"
+
+    @callback
+    def async_handle_bluetooth_update(
+        self, advertisement: ValveAdvertisement, change: BluetoothChange
+    ) -> None:
+        """Handle Bluetooth discovery updates for the valve."""
+
+        self._attr_available = change not in BLUETOOTH_LOST_CHANGES
+        if self._attr_available:
+            self.async_update_from_advertisement(advertisement)
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+    async def async_press(self) -> None:
+        """Refresh dashboard data immediately."""
+
+        try:
+            await self._connection.async_refresh_now()
+        except ValveCommandError as exc:
+            raise HomeAssistantError(str(exc)) from exc
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up regeneration buttons for Chandler valves."""
+    """Set up action buttons for Chandler valves."""
 
     entry_data = hass.data[DOMAIN][entry.entry_id]
     discovery_manager: ValveDiscoveryManager = entry_data[DATA_DISCOVERY_MANAGER]
     connection_manager: ValveConnectionManager = entry_data[DATA_CONNECTION_MANAGER]
-    entities: dict[str, tuple[ValveRegenerationButton, ValveRegenerationButton]] = {}
+    entities: dict[
+        str, list[ValveRegenerationButton | ValveRefreshButton]
+    ] = {}
 
     def _ensure_entities(
         advertisement: ValveAdvertisement,
     ) -> tuple[
-        tuple[ValveRegenerationButton, ValveRegenerationButton] | None,
-        list[ValveRegenerationButton],
+        list[ValveRegenerationButton | ValveRefreshButton] | None,
+        list[ValveRegenerationButton | ValveRefreshButton],
     ]:
         existing = entities.get(advertisement.address)
         if existing is not None:
@@ -140,18 +184,19 @@ async def async_setup_entry(
             )
             return None, []
 
-        created = (
+        created: list[ValveRegenerationButton | ValveRefreshButton] = [
+            ValveRefreshButton(advertisement, connection),
             ValveRegenerationButton(
                 advertisement, connection, advance_current_cycle=False
             ),
             ValveRegenerationButton(
                 advertisement, connection, advance_current_cycle=True
             ),
-        )
+        ]
         entities[advertisement.address] = created
         return created, list(created)
 
-    initial_entities: list[ValveRegenerationButton] = []
+    initial_entities: list[ValveRegenerationButton | ValveRefreshButton] = []
     for advertisement in discovery_manager.devices.values():
         _, created = _ensure_entities(advertisement)
         initial_entities.extend(created)

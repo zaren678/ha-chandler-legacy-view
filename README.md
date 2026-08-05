@@ -23,9 +23,10 @@ Home Assistant as entities that can participate in automations or dashboards.
   via device information and entity state attributes.
 * Polls authenticated EVB019 dashboard data for flow, capacity, cycle state,
   cycle timing, battery, and other operational sensors.
-* Provides guarded **Regenerate Now** and **Next Regeneration Step** buttons.
-  The integration refreshes valve state before sending the state-dependent
-  command, so only the action valid for the current cycle state is available.
+* Provides **Refresh Now** plus guarded **Regenerate Now** and
+  **Next Regeneration Step** buttons. The integration refreshes valve state
+  before sending the state-dependent command, so only the action valid for the
+  current cycle state is available.
 
 This repository currently focuses on the scaffolding required for discovery and
 entity creation. Additional device metadata, richer entities, diagnostics, and
