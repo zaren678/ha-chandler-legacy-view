@@ -1,7 +1,7 @@
 {
   "domain": "chandler_legacy_view",
   "name": "Chandler Legacy View",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "config_flow": true,
   "documentation": "https://github.com/sharwell/ha-chandler-legacy-view",
   "issue_tracker": "https://github.com/sharwell/ha-chandler-legacy-view/issues",

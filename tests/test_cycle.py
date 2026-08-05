@@ -44,6 +44,8 @@ class CyclePhaseTests(unittest.TestCase):
         self.assertEqual("Position 7", _CYCLE.cycle_phase(1, 7))
 
     def test_cycle_remaining_seconds(self) -> None:
-        self.assertEqual(16, _CYCLE.cycle_remaining_seconds(1, 16))
-        self.assertEqual(0, _CYCLE.cycle_remaining_seconds(0, 16))
-        self.assertEqual(0, _CYCLE.cycle_remaining_seconds(1, -1))
+        self.assertEqual(180, _CYCLE.cycle_remaining_seconds(1, 3, 0))
+        self.assertEqual(16, _CYCLE.cycle_remaining_seconds(1, 0, 16))
+        self.assertEqual(16, _CYCLE.cycle_remaining_seconds(1, 0x7F, 16))
+        self.assertEqual(0, _CYCLE.cycle_remaining_seconds(0, 3, 16))
+        self.assertEqual(0, _CYCLE.cycle_remaining_seconds(1, -1, -1))

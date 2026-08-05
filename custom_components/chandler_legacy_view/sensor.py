@@ -356,7 +356,9 @@ class ValveCycleRemainingSensor(ValveDashboardSensor):
         if dashboard is None:
             return None
         return cycle_remaining_seconds(
-            dashboard.regen_active, dashboard.pos_option_seconds
+            dashboard.regen_active,
+            dashboard.pos_time,
+            dashboard.pos_option_seconds,
         )
 
 
@@ -402,7 +404,13 @@ class ValveCycleStateSensor(ValveDashboardSensor):
         return {
             "active": bool(dashboard.regen_active),
             "position": dashboard.regen_cycle_position,
-            "remaining_seconds": dashboard.pos_option_seconds,
+            "remaining_seconds": cycle_remaining_seconds(
+                dashboard.regen_active,
+                dashboard.pos_time,
+                dashboard.pos_option_seconds,
+            ),
+            "remaining_minutes_raw": dashboard.pos_time,
+            "remaining_seconds_raw": dashboard.pos_option_seconds,
             "position_time": dashboard.pos_time,
         }
 
