@@ -26,10 +26,14 @@ class ValvePersistentConnectionSwitch(ChandlerValveEntity, SwitchEntity):
     _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(
-        self, advertisement: ValveAdvertisement, connection: ValveConnection
+        self,
+        advertisement: ValveAdvertisement,
+        connection: ValveConnection,
+        connection_manager: ValveConnectionManager,
     ) -> None:
         super().__init__(advertisement)
         self._connection = connection
+        self._connection_manager = connection_manager
         self._attr_unique_id = f"{advertisement.address}_persistent_connection"
         self._attr_name = f"{self._attr_name} Persistent Connection"
         self._attr_available = True
@@ -62,16 +66,22 @@ class ValvePersistentConnectionSwitch(ChandlerValveEntity, SwitchEntity):
     async def async_turn_on(self, **kwargs) -> None:
         """Enable the persistent connection preference."""
 
-        await self._connection.async_set_persistent_connection_enabled(True)
-        self._attr_is_on = self._connection.persistent_connection_enabled
+        self._attr_is_on = (
+            await self._connection_manager.async_set_persistent_connection_enabled(
+                self._connection.address, True
+            )
+        )
         if self.hass is not None:
             self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
         """Disable the persistent connection preference."""
 
-        await self._connection.async_set_persistent_connection_enabled(False)
-        self._attr_is_on = self._connection.persistent_connection_enabled
+        self._attr_is_on = (
+            await self._connection_manager.async_set_persistent_connection_enabled(
+                self._connection.address, False
+            )
+        )
         if self.hass is not None:
             self.async_write_ha_state()
 
@@ -181,7 +191,9 @@ async def async_setup_entry(
                 )
                 return None, new_entities
 
-            entity = ValvePersistentConnectionSwitch(advertisement, connection)
+            entity = ValvePersistentConnectionSwitch(
+                advertisement, connection, connection_manager
+            )
             persistent_entities[advertisement.address] = entity
             new_entities.append(entity)
 

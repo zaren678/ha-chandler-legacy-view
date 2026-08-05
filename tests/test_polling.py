@@ -75,3 +75,26 @@ class PollingConfigurationTests(unittest.TestCase):
                 {"first": 2, "second": 3}, "first", 5
             ),
         )
+
+    def test_reads_persistent_connection_state(self) -> None:
+        self.assertTrue(
+            _POLLING.persistent_connection_enabled_for_address(
+                {"first": True}, "first"
+            )
+        )
+        self.assertFalse(
+            _POLLING.persistent_connection_enabled_for_address(
+                {"first": "true"}, "first"
+            )
+        )
+        self.assertFalse(
+            _POLLING.persistent_connection_enabled_for_address("invalid", "first")
+        )
+
+    def test_updates_one_connection_state_without_losing_others(self) -> None:
+        self.assertEqual(
+            {"first": False, "second": True},
+            _POLLING.updated_persistent_connection_states(
+                {"first": True, "second": True}, "first", False
+            ),
+        )

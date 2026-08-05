@@ -43,3 +43,23 @@ def updated_persistent_poll_intervals(
     intervals = dict(stored_intervals) if isinstance(stored_intervals, Mapping) else {}
     intervals[address] = normalize_persistent_poll_interval(value)
     return intervals
+
+
+def persistent_connection_enabled_for_address(
+    stored_states: object, address: str
+) -> bool:
+    """Return whether persistent polling is enabled for a valve address."""
+
+    if not isinstance(stored_states, Mapping):
+        return False
+    return stored_states.get(address) is True
+
+
+def updated_persistent_connection_states(
+    stored_states: object, address: str, enabled: bool
+) -> dict[str, bool | object]:
+    """Return stored per-valve persistent connection states with one update."""
+
+    states = dict(stored_states) if isinstance(stored_states, Mapping) else {}
+    states[address] = bool(enabled)
+    return states

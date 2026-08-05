@@ -29,6 +29,7 @@ from homeassistant.util import dt as dt_util
 from .const import (
     CONF_DEFAULT_PASSCODE,
     CONF_DEVICE_PASSCODES,
+    CONF_DEVICE_PERSISTENT_CONNECTIONS,
     CONF_DEVICE_POLL_INTERVALS,
     CONNECTION_MIN_RETRY_INTERVAL,
     CONNECTION_POLL_INTERVAL,
@@ -40,7 +41,9 @@ from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
 from .models import ValveAdvertisement, ValveDashboardData
 from .polling import (
     normalize_persistent_poll_interval,
+    persistent_connection_enabled_for_address,
     persistent_poll_interval_for_address,
+    updated_persistent_connection_states,
     updated_persistent_poll_intervals,
 )
 from .protocol import should_use_classic_password_decode
@@ -210,6 +213,7 @@ class ValveConnection:
         address: str,
         passcode_getter: Callable[[str], ValvePasscodeConfiguration] | None = None,
         persistent_poll_interval: object = None,
+        persistent_connection_enabled: bool = False,
     ) -> None:
         """Initialize the valve connection handler."""
 
@@ -238,7 +242,7 @@ class ValveConnection:
         self._authentication_listeners: list[Callable[[bool], None]] = []
         self._passcode_getter = passcode_getter
         self._crc8 = _ChandlerCrc8()
-        self._persistent_connection_enabled = False
+        self._persistent_connection_enabled = bool(persistent_connection_enabled)
         self._persistent_poll_interval = normalize_persistent_poll_interval(
             persistent_poll_interval
         )
@@ -483,7 +487,7 @@ class ValveConnection:
         if task is None:
             return False
         if task.done():
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 task.result()
             self._persistent_task = None
             return False
@@ -2416,6 +2420,7 @@ class ValveConnectionManager:
                 advertisement.address,
                 self.get_passcode,
                 self.get_persistent_poll_interval(advertisement.address),
+                self.get_persistent_connection_enabled(advertisement.address),
             )
             self._connections[advertisement.address] = connection
         connection.update_from_advertisement(advertisement)
@@ -2438,6 +2443,39 @@ class ValveConnectionManager:
             self._config_entry.options.get(CONF_DEVICE_POLL_INTERVALS),
             address,
         )
+
+    def get_persistent_connection_enabled(self, address: str) -> bool:
+        """Return the persisted persistent-connection preference for a valve."""
+
+        return persistent_connection_enabled_for_address(
+            self._config_entry.options.get(CONF_DEVICE_PERSISTENT_CONNECTIONS),
+            address,
+        )
+
+    async def async_set_persistent_connection_enabled(
+        self, address: str, enabled: bool
+    ) -> bool:
+        """Apply and persist the persistent-connection preference for a valve."""
+
+        connection = self.get_connection(address)
+        if connection is None:
+            raise ValueError(f"Unknown valve address: {address}")
+
+        await connection.async_set_persistent_connection_enabled(enabled)
+        value = connection.persistent_connection_enabled
+        states = updated_persistent_connection_states(
+            self._config_entry.options.get(CONF_DEVICE_PERSISTENT_CONNECTIONS),
+            address,
+            value,
+        )
+        self._hass.config_entries.async_update_entry(
+            self._config_entry,
+            options={
+                **self._config_entry.options,
+                CONF_DEVICE_PERSISTENT_CONNECTIONS: states,
+            },
+        )
+        return value
 
     async def async_set_persistent_poll_interval(
         self, address: str, seconds: float
