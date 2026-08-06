@@ -2578,14 +2578,14 @@ class ValveConnection:
 
         # Use parser that mimics CsStatusAndHistoryPacket counters
         try:
-            # Helpers matching CsBitUtilities
+            # Helpers matching CsBitUtilities — note Java signatures are (low, high) and (low, medium, high)
             def u8(b: int) -> int:
                 return b & 0xFF
 
-            def get_double_high_low(high: int, low: int) -> float:
+            def get_double_high_low(low: int, high: int) -> float:
                 return float((u8(high) << 8) | u8(low))
 
-            def get_double_high_med_low(high: int, med: int, low: int) -> float:
+            def get_double_high_med_low(low: int, med: int, high: int) -> float:
                 return float((u8(high) << 16) | (u8(med) << 8) | u8(low))
 
             def is_bit_set(value: int, bit: int) -> bool:
