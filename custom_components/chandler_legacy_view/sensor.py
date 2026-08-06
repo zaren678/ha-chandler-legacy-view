@@ -441,6 +441,65 @@ class ValveRegenPositionSensor(ChandlerValveEntity, SensorEntity):
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
+    # App display names per valve family (from CsAdvancedSettingsViewModel.java).
+    # Aeration/Nitro filter family is the common Evb019 case (your CS_Aeration_Fltr):
+    # P1 decompress (s), P2 air release (s), P3 backwash (min), P4 rest (min),
+    # P5 air draw (min), P6 rapid rinse (min). Positions 7-8 unused.
+    _AERATION_POSITION_NAMES: tuple[str, ...] = (
+        "Decompress",
+        "Air Release",
+        "Backwash",
+        "Rest",
+        "Air Draw",
+        "Rapid Rinse",
+        "Position 7",
+        "Position 8",
+    )
+    _AERATION_POSITION_UNITS: tuple[str, ...] = (
+        UnitOfTime.SECONDS,
+        UnitOfTime.SECONDS,
+        UnitOfTime.MINUTES,
+        UnitOfTime.MINUTES,
+        UnitOfTime.MINUTES,
+        UnitOfTime.MINUTES,
+        UnitOfTime.MINUTES,
+        UnitOfTime.MINUTES,
+    )
+
+    def _is_aeration_valve(self, adv: ValveAdvertisement | None) -> bool:
+        if adv is None:
+            return False
+        vt = adv.valve_type
+        return vt in (
+            "NitroFilter",
+            "Sidekick",
+            "CommercialAeration",
+            "CenturionNitroSidekick",
+            "CenturionNitroSidekickV3",
+            "NitroPro",
+            "NitroProSidekick",
+        ) or (vt is None and adv.model in (None, "Evb019"))
+
+    def _position_display_name(self, adv: ValveAdvertisement | None) -> str:
+        # For aeration family, use app titles; otherwise generic fallback with
+        # cycle index so unique_id stays stable.
+        if self._is_aeration_valve(adv):
+            try:
+                return self._AERATION_POSITION_NAMES[self._position_index]
+            except IndexError:
+                pass
+        return f"Regen Position {self._position_index+1}"
+
+    def _position_unit(self, adv: ValveAdvertisement | None) -> str:
+        if self._is_salt_dose():
+            return "lb"
+        if self._is_aeration_valve(adv):
+            try:
+                return self._AERATION_POSITION_UNITS[self._position_index]
+            except IndexError:
+                pass
+        return UnitOfTime.MINUTES
+
     def __init__(
         self,
         advertisement: ValveAdvertisement,
@@ -451,7 +510,8 @@ class ValveRegenPositionSensor(ChandlerValveEntity, SensorEntity):
         self._connection = connection
         self._position_index = position_index  # 0-based, P1..P8 maps to 49-56
         self._attr_unique_id = f"{advertisement.address}_regen_pos_{position_index+1}"
-        self._attr_name = f"{self._attr_name} Regen Position {position_index+1}"
+        display = self._position_display_name(advertisement)
+        self._attr_name = f"{self._attr_name} {display}"
         self._attr_available = False
         self._advanced_data: ValveAdvancedSettingsData | None = (
             connection.advanced_settings_data
@@ -486,11 +546,7 @@ class ValveRegenPositionSensor(ChandlerValveEntity, SensorEntity):
         # Read-only sensor: always available when data exists; adjustability is
         # exposed via `not_adjustable` attribute only.
         self._attr_available = True
-        is_salt = self._is_salt_dose()
-        if is_salt:
-            self._attr_native_unit_of_measurement = "lb"
-        else:
-            self._attr_native_unit_of_measurement = UnitOfTime.MINUTES
+        self._attr_native_unit_of_measurement = self._position_unit(self._advertisement)
         self._attr_native_value = data.positions[self._position_index]
 
     @callback
@@ -518,7 +574,8 @@ class ValveRegenPositionSensor(ChandlerValveEntity, SensorEntity):
         self, advertisement: ValveAdvertisement
     ) -> None:
         super().async_update_from_advertisement(advertisement)
-        self._attr_name = f"{self._attr_name} Regen Position {self._position_index+1}"
+        display = self._position_display_name(advertisement)
+        self._attr_name = f"{self._attr_name} {display}"
 
     @property
     def extra_state_attributes(self) -> dict[str, object]:
@@ -526,6 +583,7 @@ class ValveRegenPositionSensor(ChandlerValveEntity, SensorEntity):
         defaults = self._connection.advanced_settings_defaults
         attrs: dict[str, object] = {
             "position_index": self._position_index + 1,
+            "position_name": self._position_display_name(self._advertisement),
         }
         if data is not None and len(data.positions) > self._position_index:
             attrs["position_value"] = data.positions[self._position_index]
