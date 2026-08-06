@@ -2500,12 +2500,11 @@ class ValveConnection:
                 else:
                     not_adjustable.append(is_high)
                     if is_high:
-                        # App does packet[i]+128 in signed-byte domain; for
-                        # unsigned raw >127 this would be raw+128 wrapped.
-                        # Since raw already has high bit set, the displayed
-                        # value is the unsigned value (e.g. 0x8A -> 138) but
-                        # semantics are "not adjustable". Preserve raw.
-                        positions.append(raw & 0xFF)
+                        # App decodes signed byte +128: signed (-128..127) +128 = 0..255.
+                        # Unsigned raw 0x80..0xFF => signed -128..-1 => +128 => 0..127.
+                        # Equivalent to raw-128. This matches CsAdvancedSettingsPacket:
+                        # `isHighBitOn ? packet[i]+128 : packet[i]` where packet is signed.
+                        positions.append((raw & 0xFF) - 128)
                     else:
                         positions.append(raw & 0xFF)
 
