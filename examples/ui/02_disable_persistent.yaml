@@ -1,0 +1,14 @@
+# UI paste: Settings → Automations → Create Automation → ⋮ → Edit in YAML → paste this SINGLE dict
+# What this does: Turns off persistent 5m after Backwash State returns to Idle — regen done, saves BLE/battery.
+alias: "Treatment Valve — Disable persistent after regen"
+description: "Turn off persistent 5m after Backwash State returns to Idle — regen done, saves BLE/battery."
+id: treatment_valve_disable_persistent
+trigger:
+  - platform: state
+    entity_id: sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state
+    to: "Idle"
+    for: "00:05:00"
+action:
+  - service: switch.turn_off
+    target:
+      entity_id: switch.treatment_valve_treatment_valve_persistent_connection

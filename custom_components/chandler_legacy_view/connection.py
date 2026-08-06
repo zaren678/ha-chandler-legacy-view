@@ -36,8 +36,13 @@ from .const import (
     CONNECTION_TIMEOUT_SECONDS,
     DEFAULT_VALVE_PASSCODE,
 )
-from .device_registry import async_update_device_serial_number
+from .device_registry import (
+    async_update_device_serial_number,
+    async_update_device_sw_version,
+)
 from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
+from .entity import format_firmware_version
+from .firmware import decode_firmware_version, firmware_model
 from .models import (
     ValveAdvancedSettingsData,
     ValveAdvertisement,
@@ -2974,6 +2979,57 @@ class ValveConnection:
         """Update internal state from a DeviceList response packet."""
 
         self._device_list_is_twin_valve = bool(packet[2])
+
+        # Firmware is reported in the DeviceList payload (bytes 5-6, BCD-encoded)
+        # and is authoritative vs the stale manufacturer-data advertisement.
+        # e.g. 04 40 -> 4.40 vs advertised C3.63.
+        if len(packet) >= 7:
+            try:
+                major, minor, version = decode_firmware_version(
+                    packet[5], packet[6]
+                )
+                adv = self._advertisement
+                if adv is not None and version != adv.firmware_version:
+                    # Update advertisement in place so format_firmware_version matches the app
+                    adv.firmware_major = major
+                    adv.firmware_minor = minor
+                    adv.firmware_version = version
+                    adv.model = firmware_model(version)
+                    sw_version = format_firmware_version(adv)
+                    if sw_version:
+                        async_update_device_sw_version(
+                            self._hass, self._address, sw_version
+                        )
+                    _LOGGER.debug(
+                        "Valve %s DeviceList firmware updated from advertisement to %s (version %s)",
+                        self._address,
+                        sw_version,
+                        version,
+                    )
+                elif adv is None:
+                    # No prior advertisement, still update device registry if possible
+                    tmp_adv = ValveAdvertisement(
+                        address=self._address,
+                        name=None,
+                        rssi=None,
+                        manufacturer_data={},
+                        service_data={},
+                        firmware_major=major,
+                        firmware_minor=minor,
+                        firmware_version=version,
+                        model=firmware_model(version),
+                    )
+                    sw_version = format_firmware_version(tmp_adv)
+                    if sw_version:
+                        async_update_device_sw_version(
+                            self._hass, self._address, sw_version
+                        )
+            except Exception:  # pylint: disable=broad-exception-caught
+                _LOGGER.debug(
+                    "Valve %s failed to decode firmware from DeviceList packet %s",
+                    self._address,
+                    packet.hex(),
+                )
 
         decoded_password = self._decode_device_list_password(packet)
         self._device_list_decoded_password = decoded_password

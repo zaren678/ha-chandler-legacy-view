@@ -1,0 +1,165 @@
+# ==============================================================================
+# Real-entity automations for Treatment Valve (Mechanical Room) — your valve + plug
+# ==============================================================================
+# What this does:
+#   - Uses your exact entity_ids from the 2026-08-05 export (no placeholders):
+#       Backwash State  sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state
+#       Backwash Remaining sensor.mechanical_room_treatment_valve_treatment_valve_backwash_remaining
+#       Valve Error     binary_sensor.mechanical_room_treatment_valve_treatment_valve_valve_error
+#       Present Flow    sensor.treatment_valve_treatment_valve_present_flow
+#       Water Filter Plug switch.unnamed_p316m_tapo_p316m_2 (Water Filter Plug / P316M)
+#   - Turns on persistent BLE (switch.treatment_valve_treatment_valve_persistent_connection)
+#     60m before daily regen (21:00 for your 22:00 regen time) for 4s polling; off 5m after Idle.
+#     Separate connection — never blocks the 15m dashboard poll.
+#   - 2 flow-immune detectors with shared 5m lock (mode: single):
+#       A) Valve error == on for 10s — your failure mode 1 (stuck changing states)
+#       B) Stall for 120s in Decompress (1) or Air Release (2) or countdown None stuck 120s —
+#          both 120s per your request, covering your log: Decompress 10.4s motor + 84.6s
+#          (89→4s) =95s total, Air Release 9.3s motor + 44.8s gap to Backwash (GATT 133).
+#     Remediation per trigger: Next Regeneration Step → 60s wait → plug off 30s/on if still stuck.
+#   - Present flow (~0.15 GPM in Air Release) is NOT used for remediation to avoid
+#     laundry/toilet false positives; a 10m-debounced Idle+flow>0.08 notify is separate.
+# Log a good regen first: Logger.set_level custom_components.chandler_legacy_view: debug,
+#   then button.mechanical_room_treatment_valve_treatment_valve_next_regeneration_step.
+# How to use: paste automations into automations.yaml or UI → Edit in YAML,
+#   adjust the 21:00 trigger to 60m before sensor.mechanical_room_treatment_valve_treatment_valve_regeneration_time (yours is 22:00),
+#   and verify the plug entity is switch.unnamed_p316m_tapo_p316m_2 in Devices → P316M → Water Filter Plug.
+
+# BEFORE pasting: Create helper via UI → Settings → Devices & Services → Helpers → Create Helper → Toggle
+# Name: Treatment Valve remediation lock, Entity ID: input_boolean.treatment_valve_remediation_lock
+# HOW TO PASTE: 
+#   - If pasting into automations.yaml file directly (with automation: !include automations.yaml in configuration.yaml),
+#     this file is already a LIST — copy everything BELOW this line starting with "- alias:" and append to automations.yaml.
+#   - If pasting via UI → Settings → Automations → Create Automation → ⋮ → Edit in YAML, paste ONE automation at a time
+#     (one "- alias:" block) WITHOUT the leading dash, or use the UI to create 4 separate automations. Do NOT include the
+#     top-level "automation:" key — that causes “extra keys not allowed @ data['automation']”.
+# (There is also examples/helpers.yaml if you want YAML instead of UI for the input_boolean.)
+  # 1) Persistent window — 60m before daily regen time, disable 5m after regen ends.
+  # Regen Time sensor is 10:00 PM — this is 21:00 (60m before).
+  # Alternative: trigger on sensor.mechanical_room_treatment_valve_treatment_valve_regeneration_time change and offset -60m via template.
+- alias: "Treatment Valve — Enable persistent near regen"
+  description: "Turn on 4s BLE persistent polling 60m before daily regen (21:00 for 22:00 regen) so stalls show in 4s, separate connection never blocks 15m dashboard."
+  id: treatment_valve_enable_persistent
+  trigger:
+    - platform: time
+      at: "21:00:00"
+  condition:
+    - condition: state
+      entity_id: binary_sensor.treatment_valve_treatment_valve
+      state: "on"
+  action:
+    - service: switch.turn_on
+      target:
+        entity_id: switch.treatment_valve_treatment_valve_persistent_connection
+
+- alias: "Treatment Valve — Disable persistent after regen"
+  description: "Turn off persistent 5m after Backwash State returns to Idle — regen done, saves BLE/battery."
+  id: treatment_valve_disable_persistent
+  trigger:
+    - platform: state
+      entity_id: sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state
+      to: "Idle"
+      for: "00:05:00"
+  action:
+    - service: switch.turn_off
+      target:
+        entity_id: switch.treatment_valve_treatment_valve_persistent_connection
+
+  # 2) Detectors + remediation — valve error (instant) OR stall 120s in Decompress/Air Release
+  #    Both Decompress (1) 90s and Air Release (2) 1s share 120s grace: covers 10.4s/9.3s 0x7F motors
+  #    + 44.8s GATT dropout seen 2026-08-05 (Air Release motor 9.3s still 0x7F, then disconnect).
+  #    Single mode + lock prevents A and B double-firing.
+- alias: "Treatment Valve — Stuck regen remediation (valve error OR 120s stall)"
+  description: "Flow-immune detectors: A) valve_error on 10s, B) Decompress/Air Release stall 120s each (10.4s/9.3s motors + 44.8s GATT dropout) or remaining=None 120s. Lock prevents double-fire; soft fix Next Step → 60s → plug off 30s/on (switch.unnamed_p316m_tapo_p316m_2). Flow 0.15 GPM not used to avoid laundry false positives."
+  id: treatment_valve_stuck_remediation
+  mode: single
+  max_exceeded: silent
+  trigger:
+    # A: valve error during transition
+    - platform: state
+      entity_id: binary_sensor.mechanical_room_treatment_valve_treatment_valve_valve_error
+      to: "on"
+      for: "00:00:10"
+      id: valve_error
+    # B: Decompress stall 120s
+    - platform: state
+      entity_id: sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state
+      to: "Decompress (1)"
+      for: "00:02:00"
+      id: decompress_stall
+    # B: Air Release stall 120s (your request)
+    - platform: state
+      entity_id: sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state
+      to: "Air Release (2)"
+      for: "00:02:00"
+      id: air_release_stall
+    # B: countdown stuck (None during 0x7F motor, should not stay None >120s)
+    - platform: state
+      entity_id: sensor.mechanical_room_treatment_valve_treatment_valve_backwash_remaining
+      to: ~
+      for: "00:02:00"
+      id: remaining_stuck
+  condition:
+    - condition: state
+      entity_id: input_boolean.treatment_valve_remediation_lock
+      state: "off"
+    # Only when actually in a cycle — Backwash State != Idle (also exposed as attributes.active)
+    - condition: template
+      value_template: "{{ states('sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state') != 'Idle' }}"
+  action:
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.treatment_valve_remediation_lock
+    - service: system_log.write
+      data:
+        message: "Treatment Valve stuck: {{ trigger.id }} state={{ states('sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state') }} remaining={{ states('sensor.mechanical_room_treatment_valve_treatment_valve_backwash_remaining') }} error={{ states('binary_sensor.mechanical_room_treatment_valve_treatment_valve_valve_error') }} flow={{ states('sensor.treatment_valve_treatment_valve_present_flow') }}"
+        level: warning
+        logger: custom_components.chandler_legacy_view.automation
+    # Soft fix first
+    - service: button.press
+      target:
+        entity_id: button.mechanical_room_treatment_valve_treatment_valve_next_regeneration_step
+    - delay: "00:01:00"
+    - if:
+        - condition: or
+          conditions:
+            - condition: state
+              entity_id: binary_sensor.mechanical_room_treatment_valve_treatment_valve_valve_error
+              state: "on"
+            - condition: state
+              entity_id: sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state
+              state: "Air Release (2)"
+            - condition: state
+              entity_id: sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state
+              state: "Decompress (1)"
+      then:
+        - service: switch.turn_off
+          target:
+            entity_id: switch.unnamed_p316m_tapo_p316m_2
+        - delay: "00:00:30"
+        - service: switch.turn_on
+          target:
+            entity_id: switch.unnamed_p316m_tapo_p316m_2
+    - delay: "00:05:00"
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.treatment_valve_remediation_lock
+
+  # 3) Flow notify only — 10m debounce, NOT remediation, so laundry (2m) won't trigger.
+  # Threshold 0.08 GPM: catches 0.15 GPM drain while ignoring idle 0.0. Requires 10m continuous
+  # within 2h of last regen start (Backwash State left Idle). No plug cycle.
+- alias: "Treatment Valve — Notify: Idle but water flowing (possible fake Idle)"
+  description: "Notify-only 10m-debounced Idle + present_flow >0.08 for 10m within 2h of regen — catches 0.15 GPM drain, laundry 2m won't trigger, no plug cycle."
+  id: treatment_valve_fake_idle_notify
+  trigger:
+    - platform: template
+      value_template: >
+        {{ is_state('sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state','Idle')
+           and (now() - states.sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state.last_changed).total_seconds() < 7200
+           and states('sensor.treatment_valve_treatment_valve_present_flow')|float(0) > 0.08 }}
+      for: "00:10:00"
+  action:
+    - service: persistent_notification.create
+      data:
+        title: "Treatment Valve: possible fake Idle — water still flowing"
+        message: "Backwash State Idle but present_flow {{ states('sensor.treatment_valve_treatment_valve_present_flow') }} GPM for 10m within 2h of regen. State={{ states('sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state') }} remaining={{ states('sensor.mechanical_room_treatment_valve_treatment_valve_backwash_remaining') }}. Check drain outside."

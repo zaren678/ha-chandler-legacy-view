@@ -1,0 +1,72 @@
+# UI paste: Settings → Automations → Create Automation → ⋮ → Edit in YAML → paste this SINGLE dict (no leading "-")
+# What this does: Flow-immune stuck detection + remediation. Detectors: A) valve_error on 10s (stuck changing states), B) Decompress (1) or Air Release (2) stall 120s each (10.4s/9.3s 0x7F motors + 44.8s GATT dropout from your 2026-08-05 log) or remaining=None 120s. Lock input_boolean.treatment_valve_remediation_lock prevents A/B double-fire. Action: Next Step → 60s wait → plug switch.unnamed_p316m_tapo_p316m_2 off 30s/on if still stuck, then 5m lock.
+# Requires helper: Settings → Helpers → Toggle → "Treatment Valve remediation lock" (input_boolean.treatment_valve_remediation_lock)
+alias: "Treatment Valve — Stuck regen remediation (valve error OR 120s stall)"
+description: "Flow-immune detectors: A) valve_error on 10s, B) Decompress/Air Release stall 120s each (10.4s/9.3s motors + 44.8s GATT dropout) or remaining=None 120s. Lock prevents double-fire; soft fix Next Step → 60s → plug off 30s/on (switch.unnamed_p316m_tapo_p316m_2). Flow 0.15 GPM not used to avoid laundry false positives."
+id: treatment_valve_stuck_remediation
+mode: single
+max_exceeded: silent
+trigger:
+  - platform: state
+    entity_id: binary_sensor.mechanical_room_treatment_valve_treatment_valve_valve_error
+    to: "on"
+    for: "00:00:10"
+    id: valve_error
+  - platform: state
+    entity_id: sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state
+    to: "Decompress (1)"
+    for: "00:02:00"
+    id: decompress_stall
+  - platform: state
+    entity_id: sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state
+    to: "Air Release (2)"
+    for: "00:02:00"
+    id: air_release_stall
+  - platform: state
+    entity_id: sensor.mechanical_room_treatment_valve_treatment_valve_backwash_remaining
+    to: ~
+    for: "00:02:00"
+    id: remaining_stuck
+condition:
+  - condition: state
+    entity_id: input_boolean.treatment_valve_remediation_lock
+    state: "off"
+  - condition: template
+    value_template: "{{ states('sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state') != 'Idle' }}"
+action:
+  - service: input_boolean.turn_on
+    target:
+      entity_id: input_boolean.treatment_valve_remediation_lock
+  - service: system_log.write
+    data:
+      message: "Treatment Valve stuck: {{ trigger.id }} state={{ states('sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state') }} remaining={{ states('sensor.mechanical_room_treatment_valve_treatment_valve_backwash_remaining') }} error={{ states('binary_sensor.mechanical_room_treatment_valve_treatment_valve_valve_error') }} flow={{ states('sensor.treatment_valve_treatment_valve_present_flow') }}"
+      level: warning
+      logger: custom_components.chandler_legacy_view.automation
+  - service: button.press
+    target:
+      entity_id: button.mechanical_room_treatment_valve_treatment_valve_next_regeneration_step
+  - delay: "00:01:00"
+  - if:
+      - condition: or
+        conditions:
+          - condition: state
+            entity_id: binary_sensor.mechanical_room_treatment_valve_treatment_valve_valve_error
+            state: "on"
+          - condition: state
+            entity_id: sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state
+            state: "Air Release (2)"
+          - condition: state
+            entity_id: sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state
+            state: "Decompress (1)"
+    then:
+      - service: switch.turn_off
+        target:
+          entity_id: switch.unnamed_p316m_tapo_p316m_2
+      - delay: "00:00:30"
+      - service: switch.turn_on
+        target:
+          entity_id: switch.unnamed_p316m_tapo_p316m_2
+  - delay: "00:05:00"
+  - service: input_boolean.turn_off
+    target:
+      entity_id: input_boolean.treatment_valve_remediation_lock

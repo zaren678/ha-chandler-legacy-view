@@ -1,0 +1,17 @@
+# UI paste: Settings → Automations → Create Automation → ⋮ → Edit in YAML → paste this SINGLE dict
+# What this does: Notify-only (no plug cycle) 10m-debounced Idle + present_flow >0.08 for 10m within 2h of regen — catches 0.15 GPM drain outside when valve fakes Idle (your failure mode 2), laundry 2m won't trigger.
+alias: "Treatment Valve — Notify: Idle but water flowing (possible fake Idle)"
+description: "Notify-only 10m-debounced Idle + present_flow >0.08 for 10m within 2h of regen — catches 0.15 GPM drain, laundry 2m won't trigger, no plug cycle."
+id: treatment_valve_fake_idle_notify
+trigger:
+  - platform: template
+    value_template: >
+      {{ is_state('sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state','Idle')
+         and (now() - states.sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state.last_changed).total_seconds() < 7200
+         and states('sensor.treatment_valve_treatment_valve_present_flow')|float(0) > 0.08 }}
+    for: "00:10:00"
+action:
+  - service: persistent_notification.create
+    data:
+      title: "Treatment Valve: possible fake Idle — water still flowing"
+      message: "Backwash State Idle but present_flow {{ states('sensor.treatment_valve_treatment_valve_present_flow') }} GPM for 10m within 2h of regen. State={{ states('sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state') }} remaining={{ states('sensor.mechanical_room_treatment_valve_treatment_valve_backwash_remaining') }}. Check drain outside."

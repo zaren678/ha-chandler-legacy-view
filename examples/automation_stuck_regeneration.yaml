@@ -1,0 +1,139 @@
+# ==============================================================================
+# Example: Stuck-regeneration handling (GENERIC placeholder — CS_Aeration_Fltr)
+# ==============================================================================
+# What this does:
+#   - Turns on the valve's persistent BLE connection 60m before the daily regen time
+#     so we get 4s polling (separate connection, never blocks 15m dashboard).
+#   - Runs 2 flow-immune detectors:
+#       A) Valve error (binary_sensor valve_error == on for 10s) — instant transition fault
+#       B) Stall in Decompress (1) or Air Release (2) for 120s each, plus countdown
+#          stuck at None for 120s (covers 10.4s/9.3s 0x7F motors + 44.8s GATT dropout
+#          seen 2026-08-05 where Air Release stayed 0x7F then disconnected).
+#     Both 120s per user request (Decompress 90s spec + Air Release 1s spec).
+#   - Shared input_boolean lock + mode: single prevents A and B double-firing.
+#     Remediation is soft then hard: Next Regeneration Step → 60s wait → smart plug off 30s/on.
+#   - Present flow (~0.15 GPM during Air Release) is NOT used for remediation to avoid
+#     laundry/toilet (2-5 GPM) false positives; a 10m-debounced Idle+flow notify is separate.
+# Requires: ha-chandler-legacy-view, smart plug switch.filter_smart_plug
+# Log a good regen first: Developer Tools → Services → Logger.set_level
+#   custom_components.chandler_legacy_view: debug, then press Regenerate Now.
+# How to use: replace cs_aeration_fltr entity_ids with your valve's ids, set the 01:00
+#   trigger to 60m before your Regeneration Time sensor, and put this in automations.yaml
+#   or import via UI → Automations → ⋮ → Edit in YAML.
+
+# BEFORE pasting: Create helper via UI → Settings → Devices & Services → Helpers → Create Helper → Toggle
+# Name: Chandler remediation lock, Entity ID: input_boolean.chandler_remediation_lock
+# HOW TO PASTE:
+#   - automations.yaml file: copy list items starting "- alias:" below (no "automation:" wrapper)
+#   - UI → Create Automation → Edit in YAML: paste ONE "- alias:" block at a time without leading dash, or create 4 separate automations. Do NOT include "automation:" — that causes “extra keys not allowed @ data['automation']”.
+  # 1) Persistent connection window — enable ~60m before scheduled regen, disable 5m after idle.
+- alias: "Chandler — Enable persistent near regen time"
+  description: "Enable 4s persistent BLE 60m before regen for stall visibility, separate connection."
+  trigger:
+    - platform: time
+      at: "01:00:00"  # 60m before sensor.cs_aeration_fltr_regeneration_time (02:00 AM on this valve)
+  condition: "{{ is_state('binary_sensor.cs_aeration_fltr_available','on') }}"
+  action:
+    - service: switch.turn_on
+      target: {entity_id: switch.cs_aeration_fltr_persistent_connection}
+
+- alias: "Chandler — Disable persistent after regen"
+  description: "Disable persistent 5m after regen_active off, saves BLE."
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.cs_aeration_fltr_regeneration_active
+      to: "off"
+      for: "00:05:00"
+  action:
+    - service: switch.turn_off
+      target: {entity_id: switch.cs_aeration_fltr_persistent_connection}
+
+  # 2) Detector A — valve error during transition (instant, no timing)
+  # 3) Detector B — stall in Decompress (1) or Air Release (2), both 120s per user request
+  # Single remediation lock prevents A and B double-firing and survives the 9-10s 0x7F motor.
+- alias: "Chandler — Stuck regeneration remediation (A: valve error, B: 120s stall)"
+  description: "Flow-immune A valve_error 10s + B Decompress/Air Release 120s stall, lock prevents double-fire, Next Step → plug cycle."
+  mode: single
+  max_exceeded: silent
+  trigger:
+    # A: valve error
+    - platform: state
+      entity_id: binary_sensor.cs_aeration_fltr_valve_error
+      to: "on"
+      for: "00:00:10"
+      id: valve_error
+    # B: Decompress 120s (90s spec + 10.4s motor + dropout grace)
+    - platform: state
+      entity_id: sensor.cs_aeration_fltr_regeneration_state
+      to: "Decompress (1)"
+      for: "00:02:00"
+      id: decompress_stall
+    # B: Air Release 120s (1s spec + 9.3s motor + 44.8s gap grace per 2026-08-05 log)
+    - platform: state
+      entity_id: sensor.cs_aeration_fltr_regeneration_state
+      to: "Air Release (2)"
+      for: "00:02:00"
+      id: air_release_stall
+    # B: countdown stuck (None during 0x7F, should not stay None >120s)
+    - platform: state
+      entity_id: sensor.cs_aeration_fltr_cycle_remaining_seconds
+      to: ~
+      for: "00:02:00"
+      id: remaining_stuck
+  condition:
+    - condition: state
+      entity_id: input_boolean.chandler_remediation_lock
+      state: "off"
+    - condition: state
+      entity_id: binary_sensor.cs_aeration_fltr_regeneration_active
+      state: "on"
+  action:
+    - service: input_boolean.turn_on
+      target: {entity_id: input_boolean.chandler_remediation_lock}
+    - service: system_log.write
+      data:
+        message: "Chandler stuck regen detected: {{ trigger.id }} state={{ states('sensor.cs_aeration_fltr_regeneration_state') }} remaining={{ states('sensor.cs_aeration_fltr_cycle_remaining_seconds') }} error={{ states('binary_sensor.cs_aeration_fltr_valve_error') }}"
+        level: warning
+        logger: custom_components.chandler_legacy_view.automation
+    # Soft fix first — Next Step only valid when active
+    - service: button.press
+      target: {entity_id: button.cs_aeration_fltr_next_regeneration_step}
+    - delay: "00:01:00"
+    - if:
+        - condition: or
+          conditions:
+            - condition: state
+              entity_id: binary_sensor.cs_aeration_fltr_valve_error
+              state: "on"
+            - condition: state
+              entity_id: sensor.cs_aeration_fltr_regeneration_state
+              state: "Air Release (2)"
+            - condition: state
+              entity_id: sensor.cs_aeration_fltr_regeneration_state
+              state: "Decompress (1)"
+      then:
+        - service: switch.turn_off
+          target: {entity_id: switch.filter_smart_plug}
+        - delay: "00:00:30"
+        - service: switch.turn_on
+          target: {entity_id: switch.filter_smart_plug}
+    - delay: "00:05:00"
+    - service: input_boolean.turn_off
+      target: {entity_id: input_boolean.chandler_remediation_lock}
+
+  # 4) Flow notify only — 10m debounce so laundry (2-5 GPM for 2m) does not trigger, drain (0.15 GPM continuous) does.
+  # Does NOT remediate, only notifies. Present flow is ~0.15 during Air Release, so 0.08 threshold.
+- alias: "Chandler — Notify: Idle but water still flowing (possible fake Idle)"
+  description: "Notify-only Idle + flow >0.08 for 10m within 2h of regen, laundry-safe."
+  trigger:
+    - platform: template
+      value_template: >
+        {{ is_state('sensor.cs_aeration_fltr_regeneration_state','Idle')
+           and (now() - states.binary_sensor.cs_aeration_fltr_regeneration_active.last_changed).total_seconds() < 7200
+           and states('sensor.cs_aeration_fltr_present_flow')|float(0) > 0.08 }}
+      for: "00:10:00"
+  action:
+    - service: persistent_notification.create
+      data:
+        title: "Chandler: possible fake Idle — water flowing"
+        message: "Idle but present_flow {{ states('sensor.cs_aeration_fltr_present_flow') }} GPM for 10m within 2h of regen. Check drain outside. Log: sensor.cs_aeration_fltr_cycle_remaining_seconds={{ states('sensor.cs_aeration_fltr_cycle_remaining_seconds') }}"

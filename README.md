@@ -24,6 +24,7 @@ Home Assistant as entities that can participate in automations or dashboards.
 * **Controls (read-only except guarded regeneration):** `Refresh Now` (dashboard `117` only), `Regenerate Now` / `Next Regeneration Step` (Evb019 only, refreshes state before send so only valid action is available). Regen cycle timings are intentionally not writable.
 * **Diagnostics:** polling interval + persistent-connection toggle per valve (persisted per address, survives restarts), reset-buffer `114` sent on disconnect.
 * **Probe:** `tools/chandler_ble_probe.py` does read-only `116→117→118→119` captures (`--dashboard-seconds`/`--advanced-settings-seconds`/`--history-seconds`) for manual validation; `diagnostics/` is gitignored.
+* **Stuck-regeneration handling (example):** `examples/automation_stuck_regeneration.yaml` — enable `persistent_connection` 60m before `Regeneration Time` (so 4s polling, separate BLE conn) and run 2 flow-immune detectors: (A) `valve_error == on` for 10s, (B) `Decompress (1)` / `Air Release (2)` stall for **120s** each (covers 10.4s/9.3s `0x7F` motors + 44.8s GATT dropout seen 2026-08-05) and `cycle_remaining_seconds` stuck `None` 120s. Shared `input_boolean` lock prevents A/B double-fire; remediation is `Next Step` → 60s wait → smart-plug `off 30s/on`. `present_flow` (~0.15 GPM during Air Release) is **not** used for remediation to avoid laundry/toilet false positives; a 10m-debounced `Idle + flow >0.08` notify is included separately.
 
 ## Installation
 

@@ -1,0 +1,17 @@
+# UI paste: Settings → Automations → Create Automation → ⋮ → Edit in YAML → paste this SINGLE dict (no leading "-")
+# Helper needed first: Settings → Helpers → Toggle → Name "Treatment Valve remediation lock" (input_boolean.treatment_valve_remediation_lock)
+# What this does: Turns on 4s BLE persistent polling at 21:00 (60m before your 22:00 regen) so stalls are visible at 4s. Separate connection, never blocks 15m dashboard.
+alias: "Treatment Valve — Enable persistent near regen"
+description: "Turn on 4s BLE persistent polling 60m before daily regen (21:00 for 22:00 regen) so stalls show in 4s, separate connection never blocks 15m dashboard."
+id: treatment_valve_enable_persistent
+trigger:
+  - platform: time
+    at: "21:00:00"
+condition:
+  - condition: state
+    entity_id: binary_sensor.treatment_valve_treatment_valve
+    state: "on"
+action:
+  - service: switch.turn_on
+    target:
+      entity_id: switch.treatment_valve_treatment_valve_persistent_connection

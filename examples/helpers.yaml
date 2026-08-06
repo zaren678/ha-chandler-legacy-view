@@ -1,0 +1,10 @@
+# Optional: if you prefer YAML over UI helpers, put this in configuration.yaml
+# (NOT in automations.yaml) then restart HA.
+# UI path: Settings → Devices & Services → Helpers → Create Helper → Toggle
+input_boolean:
+  treatment_valve_remediation_lock:
+    name: Treatment Valve remediation lock
+    icon: mdi:lock-clock
+  chandler_remediation_lock:
+    name: Chandler remediation lock
+    icon: mdi:lock
