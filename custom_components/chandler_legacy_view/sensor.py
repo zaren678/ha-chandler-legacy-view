@@ -208,6 +208,27 @@ class ValveTimeOfDaySensor(ValveDashboardSensor):
         )
 
 
+class ValveRegenerationTimeSensor(ValveDashboardSensor):
+    """Represent the scheduled regeneration time of day (when the system regenerates)."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP if False else None  # keep as string time, not timestamp entity
+
+    def __init__(self, advertisement: ValveAdvertisement, connection: ValveConnection) -> None:
+        super().__init__(
+            advertisement,
+            connection,
+            unique_id_suffix="regeneration_time",
+            name_suffix="Regeneration Time",
+        )
+
+    def _extract_native_value(self, dashboard: ValveDashboardData | None) -> str | None:
+        if dashboard is None:
+            return None
+        # Dashboard stores hour (1-12) + is_pm flag, no minutes — app shows e.g. "2:00 AM"
+        # Use helper with minute 0 for consistent formatting.
+        return format_time_of_day(dashboard.regeneration_time_hour, 0, dashboard.regeneration_time_is_pm)
+
+
 class ValveBatteryCapacitySensor(ValveDashboardSensor):
     """Represent the battery capacity reported by a non-Clack valve."""
 
@@ -820,6 +841,7 @@ async def async_setup_entry(
     flow_entities: dict[str, ValvePresentFlowSensor] = {}
     hardness_entities: dict[str, ValveWaterHardnessSensor] = {}
     time_entities: dict[str, ValveTimeOfDaySensor] = {}
+    regeneration_time_entities: dict[str, ValveRegenerationTimeSensor] = {}
     battery_entities: dict[str, ValveBatteryCapacitySensor] = {}
     soft_water_entities: dict[str, ValveSoftWaterRemainingSensor] = {}
     days_entities: dict[str, ValveDaysUntilRegenerationSensor] = {}
@@ -895,6 +917,16 @@ async def async_setup_entry(
             time_entities,
             factory=lambda adv, conn: ValveTimeOfDaySensor(adv, conn),
             debug_description="time of day",
+        )
+
+    def _ensure_regeneration_time_entity(
+        advertisement: ValveAdvertisement,
+    ) -> tuple[ValveDashboardSensor | None, list[ValveDashboardSensor]]:
+        return _ensure_dashboard_entity(
+            advertisement,
+            regeneration_time_entities,
+            factory=lambda adv, conn: ValveRegenerationTimeSensor(adv, conn),
+            debug_description="regeneration time",
         )
 
     def _ensure_battery_entity(
@@ -1043,6 +1075,7 @@ async def async_setup_entry(
         _ensure_flow_entity,
         _ensure_hardness_entity,
         _ensure_time_entity,
+        _ensure_regeneration_time_entity,
         _ensure_battery_entity,
         _ensure_soft_water_entity,
         _ensure_days_entity,
@@ -1084,6 +1117,7 @@ async def async_setup_entry(
         flow_entities,
         hardness_entities,
         time_entities,
+        regeneration_time_entities,
         battery_entities,
         soft_water_entities,
         days_entities,
