@@ -27,7 +27,8 @@ Verify that the valve is visible without connecting:
 python3 tools/chandler_ble_probe.py --scan-only
 ```
 
-Run one authentication attempt followed by a Dashboard request:
+Run one authentication attempt followed by read-only Dashboard, Advanced
+Settings, and Status & History requests:
 
 ```sh
 python3 tools/chandler_ble_probe.py

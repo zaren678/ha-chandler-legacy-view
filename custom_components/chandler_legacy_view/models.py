@@ -60,6 +60,41 @@ class ValveAdvertisement:
 
 
 @dataclass(slots=True)
+class ValveAdvancedSettingsData:
+    """Parsed data returned by the EVB019 Advanced Settings request."""
+
+    positions: tuple[int, ...]
+    position_not_adjustable: tuple[bool, ...]
+    regen_day_override: int | None = None
+    reserve_capacity: int | None = None
+    resin_grains_capacity: int | None = None
+    air_recharge_frequency: int | None = None
+
+
+@dataclass(slots=True)
+class ValveHistoryData:
+    """Parsed data returned by the EVB019 Status and History request (119)."""
+
+    # Current status snapshot (packet 0)
+    current_water_flow: float | None = None
+    total_gallons: int | None = None
+    total_gallons_resettable: int | None = None
+    regen_counter: int | None = None
+    regen_counter_resettable: int | None = None
+    regen_active: int | None = None
+    is_prefill_soak_mode: bool | None = None
+    shutoff_setting: bool | None = None
+    bypass_setting: bool | None = None
+    shutoff_state: bool | None = None
+    bypass_state: bool | None = None
+    display_off: bool | None = None
+    # Graphs (read-only, for diagnostics / history)
+    water_usage_day: tuple[float, ...] | None = None  # 62 floats, *10 gal
+    water_usage_regen: tuple[float, ...] | None = None  # 42 floats, gal per regen
+    peak_flow: tuple[float, ...] | None = None  # 62 floats, GPM
+
+
+@dataclass(slots=True)
 class ValveDashboardData:
     """Parsed data returned by the EVB019 Dashboard request."""
 

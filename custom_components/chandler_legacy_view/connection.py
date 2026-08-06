@@ -8,7 +8,7 @@ import inspect
 import logging
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum, IntEnum
 from random import SystemRandom
 
@@ -38,7 +38,12 @@ from .const import (
 )
 from .device_registry import async_update_device_serial_number
 from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
-from .models import ValveAdvertisement, ValveDashboardData
+from .models import (
+    ValveAdvancedSettingsData,
+    ValveAdvertisement,
+    ValveDashboardData,
+    ValveHistoryData,
+)
 from .polling import (
     normalize_persistent_poll_interval,
     persistent_connection_enabled_for_address,
@@ -96,6 +101,14 @@ _EVB019_REQUEST_PACKET_LENGTH = 20
 _DEVICE_LIST_RESPONSE_TIMEOUT_SECONDS = 5
 _DASHBOARD_RESPONSE_TIMEOUT_SECONDS = 5
 _DASHBOARD_PACKET_COUNT = 6
+_ADVANCED_SETTINGS_RESPONSE_TIMEOUT_SECONDS = 5
+_ADVANCED_SETTINGS_PACKET_COUNT = 2
+_HISTORY_RESPONSE_TIMEOUT_SECONDS = 12
+_HISTORY_MAX_PACKETS = 14
+# Separate polling intervals for infrequent data — dashboard is frequent (15 min + persistent),
+# advanced/history are heavy and fetched on their own schedule so they never delay dashboard.
+_ADVANCED_SETTINGS_POLL_INTERVAL = timedelta(hours=1)
+_HISTORY_POLL_INTERVAL = timedelta(hours=6)
 _DEFAULT_SERIAL_NUMBER = "FFFFFFFF"
 _MAX_AUTHENTICATION_ATTEMPTS = 4
 
@@ -239,6 +252,16 @@ class ValveConnection:
         self._authentication_failed_passcode: str | None = None
         self._dashboard_data: ValveDashboardData | None = None
         self._dashboard_listeners: list[Callable[[ValveDashboardData | None], None]] = []
+        self._advanced_settings_data: ValveAdvancedSettingsData | None = None
+        self._advanced_settings_defaults: ValveAdvancedSettingsData | None = None
+        self._advanced_settings_listeners: list[
+            Callable[[ValveAdvancedSettingsData | None], None]
+        ] = []
+        self._history_data: ValveHistoryData | None = None
+        self._history_listeners: list[Callable[[ValveHistoryData | None], None]] = []
+        self._history_last_success: datetime | None = None
+        self._history_lock = asyncio.Lock()
+        self._history_cooldown_until: datetime | None = None
         self._authentication_listeners: list[Callable[[bool], None]] = []
         self._passcode_getter = passcode_getter
         self._crc8 = _ChandlerCrc8()
@@ -283,6 +306,30 @@ class ValveConnection:
         """Return the parsed data from the most recent Dashboard response."""
 
         return self._dashboard_data
+
+    @property
+    def advanced_settings_data(self) -> ValveAdvancedSettingsData | None:
+        """Return the parsed data from the most recent Advanced Settings response."""
+
+        return self._advanced_settings_data
+
+    @property
+    def advanced_settings_defaults(self) -> ValveAdvancedSettingsData | None:
+        """Return the snapshot of the first-seen Advanced Settings (diagnostic, read-only)."""
+
+        return self._advanced_settings_defaults
+
+    @property
+    def history_data(self) -> ValveHistoryData | None:
+        """Return the parsed data from the most recent Status and History response."""
+
+        return self._history_data
+
+    @property
+    def history_last_success(self) -> datetime | None:
+        """Return the timestamp of the last successful History poll."""
+
+        return self._history_last_success
 
     @property
     def authentication_lockout(self) -> bool:
@@ -420,6 +467,38 @@ class ValveConnection:
 
         return _remove_listener
 
+    def add_advanced_settings_listener(
+        self, listener: Callable[[ValveAdvancedSettingsData | None], None]
+    ) -> CALLBACK_TYPE:
+        """Register a callback for Advanced Settings data updates."""
+
+        self._advanced_settings_listeners.append(listener)
+
+        if self._advanced_settings_data is not None:
+            self._hass.loop.call_soon(listener, self._advanced_settings_data)
+
+        def _remove_listener() -> None:
+            with contextlib.suppress(ValueError):
+                self._advanced_settings_listeners.remove(listener)
+
+        return _remove_listener
+
+    def add_history_listener(
+        self, listener: Callable[[ValveHistoryData | None], None]
+    ) -> CALLBACK_TYPE:
+        """Register a callback for Status and History data updates."""
+
+        self._history_listeners.append(listener)
+
+        if self._history_data is not None:
+            self._hass.loop.call_soon(listener, self._history_data)
+
+        def _remove_listener() -> None:
+            with contextlib.suppress(ValueError):
+                self._history_listeners.remove(listener)
+
+        return _remove_listener
+
     def update_from_advertisement(self, advertisement: ValveAdvertisement) -> None:
         """Record the most recent Bluetooth advertisement for the valve."""
 
@@ -433,7 +512,7 @@ class ValveConnection:
         self._available = False
 
     def schedule_poll(self) -> None:
-        """Schedule a background poll of the valve."""
+        """Schedule a background poll of the valve (dashboard only, lightweight)."""
 
         if self._hass.state != CoreState.running:
             _LOGGER.debug(
@@ -445,6 +524,27 @@ class ValveConnection:
         if not self.available:
             return
         self._hass.async_create_task(self.async_poll())
+
+    def schedule_advanced_settings_poll(self) -> None:
+        """Schedule a separate poll for Advanced Settings (118) — does not block dashboard."""
+
+        if self._hass.state != CoreState.running or not self.available:
+            return
+        # Gate by model here to avoid unnecessary connections
+        adv = self._advertisement
+        if adv is not None and adv.model not in (None, "Evb019"):
+            return
+        self._hass.async_create_task(self.async_poll_advanced_settings())
+
+    def schedule_history_poll(self) -> None:
+        """Schedule a separate poll for Status and History (119) — does not block dashboard."""
+
+        if self._hass.state != CoreState.running or not self.available:
+            return
+        adv = self._advertisement
+        if adv is not None and adv.model not in (None, "Evb019"):
+            return
+        self._hass.async_create_task(self.async_poll_history())
 
     def _cancel_cooldown(self) -> None:
         """Cancel any scheduled retry callback."""
@@ -658,7 +758,7 @@ class ValveConnection:
             await self._async_poll_locked()
 
     async def async_refresh_now(self) -> None:
-        """Immediately refresh authenticated dashboard data."""
+        """Immediately refresh authenticated dashboard data (lightweight, dashboard only)."""
 
         if not self.available:
             raise ValveCommandError("The valve is not currently available")
@@ -680,6 +780,199 @@ class ValveConnection:
             ):
                 self._next_connection_time = None
                 self.schedule_poll()
+
+    # ------------------------------------------------------------------
+    # Separate History / Advanced Settings polling (does NOT block dashboard)
+    # ------------------------------------------------------------------
+    def _history_cooldown_active(self) -> bool:
+        until = self._history_cooldown_until
+        return until is not None and dt_util.utcnow() < until
+
+    def _set_history_cooldown(self) -> None:
+        self._history_cooldown_until = dt_util.utcnow() + CONNECTION_MIN_RETRY_INTERVAL
+
+    async def async_poll_advanced_settings(self) -> bool:
+        """Poll Advanced Settings (118) in its own BLE connection, separate from dashboard."""
+
+        if not self.available:
+            return False
+        if self._history_cooldown_active():
+            _LOGGER.debug("Skipping Advanced Settings poll for %s; history cooldown active", self._address)
+            return False
+        # Don't collide with an active dashboard poll / persistent session
+        if self._lock.locked() or self._history_lock.locked() or self._persistent_task_active():
+            _LOGGER.debug("Skipping Advanced Settings poll for %s; another poll is active", self._address)
+            return False
+        async with self._history_lock:
+            async with self._lock:
+                return await self._async_poll_advanced_settings_locked()
+
+    async def async_poll_history(self) -> bool:
+        """Poll Status and History (119) in its own BLE connection, separate from dashboard."""
+
+        if not self.available:
+            return False
+        if self._history_cooldown_active():
+            _LOGGER.debug("Skipping History poll for %s; cooldown active", self._address)
+            return False
+        if self._lock.locked() or self._history_lock.locked() or self._persistent_task_active():
+            _LOGGER.debug("Skipping History poll for %s; another poll is active", self._address)
+            return False
+        async with self._history_lock:
+            async with self._lock:
+                return await self._async_poll_history_locked()
+
+    async def async_refresh_advanced_settings_now(self) -> None:
+        """Force an immediate Advanced Settings refresh (separate connection)."""
+
+        if not self.available:
+            raise ValveCommandError("The valve is not currently available")
+        restart_persistent = self._persistent_connection_enabled
+        try:
+            if self._persistent_task_active():
+                await self._async_stop_persistent_session()
+            self._history_cooldown_until = None
+            async with self._history_lock:
+                async with self._lock:
+                    self._cancel_cooldown()
+                    self._next_connection_time = None
+                    ok = await self._async_poll_advanced_settings_locked()
+                    if not ok:
+                        raise ValveCommandError("Advanced Settings did not provide fresh data")
+        finally:
+            if restart_persistent and not self._unloaded and not self._persistent_task_active():
+                self._next_connection_time = None
+                self.schedule_poll()
+
+    async def async_refresh_history_now(self) -> None:
+        """Force an immediate Status and History refresh (separate connection)."""
+
+        if not self.available:
+            raise ValveCommandError("The valve is not currently available")
+        restart_persistent = self._persistent_connection_enabled
+        try:
+            if self._persistent_task_active():
+                await self._async_stop_persistent_session()
+            self._history_cooldown_until = None
+            async with self._history_lock:
+                async with self._lock:
+                    self._cancel_cooldown()
+                    self._next_connection_time = None
+                    ok = await self._async_poll_history_locked()
+                    if not ok:
+                        raise ValveCommandError("History did not provide fresh data")
+        finally:
+            if restart_persistent and not self._unloaded and not self._persistent_task_active():
+                self._next_connection_time = None
+                self.schedule_poll()
+
+    async def _async_poll_advanced_settings_locked(self) -> bool:
+        """Establish a BLE connection and fetch only Advanced Settings."""
+
+        advertisement = self._advertisement
+        if advertisement is None:
+            return False
+        if advertisement.model not in (None, "Evb019"):
+            _LOGGER.debug("Skipping Advanced Settings for %s; model %s not supported", self._address, advertisement.model)
+            return False
+        ble_device = bluetooth.async_ble_device_from_address(self._hass, self._address, connectable=True)
+        if ble_device is None:
+            return False
+        client: BaseBleakClient | None = None
+        try:
+            try:
+                async with asyncio.timeout(CONNECTION_TIMEOUT_SECONDS):
+                    client = await establish_connection(BleakClientWithServiceCache, ble_device, self._address)
+            except asyncio.TimeoutError:
+                _LOGGER.warning("Timed out connecting to valve %s for Advanced Settings", self._address)
+                return False
+            except BLEAK_RETRY_EXCEPTIONS as exc:
+                _LOGGER.debug("Unable to connect to valve %s for Advanced Settings: %s", self._address, exc)
+                return False
+            except Exception:
+                _LOGGER.exception("Unexpected error connecting to valve %s for Advanced Settings", self._address)
+                return False
+            # Authenticate first via DeviceList
+            if not await self._async_fetch_device_information_for_history(client):
+                return False
+            sent, received = await self._async_request_advanced_settings(client)
+            if received:
+                self._last_success = dt_util.utcnow()
+                self._history_last_success = dt_util.utcnow()
+                _LOGGER.debug("Retrieved Advanced Settings from valve %s (separate poll)", self._address)
+            return received
+        finally:
+            if client is not None:
+                await self._async_disconnect_client(client)
+            self._set_history_cooldown()
+            self._set_connection_cooldown()
+
+    async def _async_poll_history_locked(self) -> bool:
+        """Establish a BLE connection and fetch only Status and History."""
+
+        advertisement = self._advertisement
+        if advertisement is None:
+            return False
+        if advertisement.model not in (None, "Evb019"):
+            _LOGGER.debug("Skipping History for %s; model %s not supported", self._address, advertisement.model)
+            return False
+        ble_device = bluetooth.async_ble_device_from_address(self._hass, self._address, connectable=True)
+        if ble_device is None:
+            return False
+        client: BaseBleakClient | None = None
+        try:
+            try:
+                async with asyncio.timeout(CONNECTION_TIMEOUT_SECONDS):
+                    client = await establish_connection(BleakClientWithServiceCache, ble_device, self._address)
+            except asyncio.TimeoutError:
+                _LOGGER.warning("Timed out connecting to valve %s for History", self._address)
+                return False
+            except BLEAK_RETRY_EXCEPTIONS as exc:
+                _LOGGER.debug("Unable to connect to valve %s for History: %s", self._address, exc)
+                return False
+            except Exception:
+                _LOGGER.exception("Unexpected error connecting to valve %s for History", self._address)
+                return False
+            if not await self._async_fetch_device_information_for_history(client):
+                return False
+            sent, received = await self._async_request_status_and_history(client)
+            if received:
+                self._history_last_success = dt_util.utcnow()
+                _LOGGER.debug("Retrieved Status and History from valve %s (separate poll)", self._address)
+            return received
+        finally:
+            if client is not None:
+                await self._async_disconnect_client(client)
+            self._set_history_cooldown()
+            self._set_connection_cooldown()
+
+    async def _async_fetch_device_information_for_history(self, client: BaseBleakClient) -> bool:
+        """Authenticate (DeviceList) without requesting Dashboard — for separate history/advanced polls."""
+
+        advertisement = self._advertisement
+        if advertisement is None:
+            return False
+        model = advertisement.model
+        if model not in (None, "Evb019"):
+            return False
+        request_sent, response_received = await self._async_request_device_list(client)
+        if not request_sent or not response_received:
+            return False
+        authenticated = self._device_list_authentication_state == ValveAuthenticationState.AUTHENTICATED
+        authentication_required = self._device_list_password_state == ValvePasswordDecodeState.AUTH_NEEDED
+        if authentication_required and not authenticated:
+            passcode = self.get_configured_passcode()
+            if passcode is not None:
+                passcode = passcode.strip()
+            self._reset_authentication_failure_if_needed(passcode)
+            if passcode is None or self._parse_passcode(passcode) is None:
+                return False
+            if self._authentication_failed and passcode == self._authentication_failed_passcode:
+                return False
+            if self._device_list_password_state == ValvePasswordDecodeState.AUTH_NEEDED:
+                return False
+            return False
+        return True
 
     async def async_regenerate(self, *, advance_current_cycle: bool) -> None:
         """Start regeneration or advance its current step after verifying state."""
@@ -1005,6 +1298,13 @@ class ValveConnection:
                 "Valve %s did not provide a Dashboard response during this poll",
                 self._address,
             )
+
+        # NOTE: Advanced Settings (118) and Status and History (119) are NOT
+        # fetched here. Dashboard is intentionally lightweight and frequent
+        # (15min + persistent). History/Advanced are fetched via separate
+        # dedicated polls (see async_poll_advanced_settings /
+        # async_poll_history) on their own schedule/cooldown so they never
+        # block or delay dashboard updates.
 
         return dashboard_response_received
 
@@ -1699,6 +1999,184 @@ class ValveConnection:
         finally:
             await self._async_unsubscribe_notifications(client, subscriptions)
 
+    async def _async_request_advanced_settings(
+        self, client: BaseBleakClient
+    ) -> tuple[bool, bool]:
+        """Send an Advanced Settings request and wait for the 2-packet response."""
+
+        loop = asyncio.get_running_loop()
+        response_future: asyncio.Future[list[bytes]] = loop.create_future()
+        packets: dict[int, bytes] = {}
+
+        def _notification_handler(_: int | str, data: bytearray) -> None:
+            if response_future.done():
+                return
+            packet = bytes(data)
+            index = self._get_advanced_settings_packet_index(packet, packets)
+            status = f"index {index}" if index is not None else "ignored"
+            _LOGGER.debug(
+                "Valve %s Advanced Settings packet %s -> %s",
+                self._address,
+                packet.hex(),
+                status,
+            )
+            if index is None:
+                return
+            packets[index] = packet
+            if len(packets) == _ADVANCED_SETTINGS_PACKET_COUNT:
+                try:
+                    ordered = [packets[i] for i in range(_ADVANCED_SETTINGS_PACKET_COUNT)]
+                except KeyError:
+                    return
+                response_future.set_result(ordered)
+
+        subscriptions = await self._async_subscribe_to_notifications(
+            client, _notification_handler
+        )
+
+        try:
+            request_sent = await self._async_send_request(
+                client, ValveRequestCommand.ADVANCED_SETTINGS
+            )
+            if not request_sent:
+                if not response_future.done():
+                    response_future.cancel()
+                return False, False
+
+            if not subscriptions:
+                if not response_future.done():
+                    response_future.cancel()
+                _LOGGER.debug(
+                    "Valve %s does not expose a notifying characteristic for Advanced Settings responses",
+                    self._address,
+                )
+                return True, False
+
+            try:
+                async with asyncio.timeout(
+                    _ADVANCED_SETTINGS_RESPONSE_TIMEOUT_SECONDS
+                ):
+                    packets_list = await response_future
+            except asyncio.TimeoutError:
+                if not response_future.done():
+                    response_future.cancel()
+                _LOGGER.debug(
+                    "Timed out waiting for Advanced Settings response from valve %s",
+                    self._address,
+                )
+                return True, False
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if not response_future.done():
+                    response_future.cancel()
+                _LOGGER.exception(
+                    "Unexpected error while waiting for Advanced Settings response from valve %s",
+                    self._address,
+                )
+                return True, False
+
+            self._handle_advanced_settings_packets(packets_list)
+            return True, True
+        finally:
+            await self._async_unsubscribe_notifications(client, subscriptions)
+
+    async def _async_request_status_and_history(
+        self, client: BaseBleakClient
+    ) -> tuple[bool, bool]:
+        """Send a Status and History request and wait for the multi-packet response."""
+
+        loop = asyncio.get_running_loop()
+        response_future: asyncio.Future[list[bytes]] = loop.create_future()
+        # Collect all 119 packets in order received; parsing decides completeness
+        packets: list[bytes] = []
+        # For early completion detection
+        complete = False
+
+        def _is_history_packet(packet: bytes) -> bool:
+            return len(packet) >= 3 and packet[0] == 119 and packet[1] == 119
+
+        def _notification_handler(_: int | str, data: bytearray) -> None:
+            nonlocal complete
+            if response_future.done():
+                return
+            packet = bytes(data)
+            if not _is_history_packet(packet):
+                _LOGGER.debug("Valve %s History packet ignored %s", self._address, packet.hex())
+                return
+            # Store
+            packets.append(packet)
+            _LOGGER.debug("Valve %s History packet %d %s", self._address, len(packets), packet.hex())
+            # Early complete check: last packet tail 58 and we have enough packets
+            # Graphs complete when day tail 56, regen tail 57, peak tail 58
+            if len(packets) >= _HISTORY_MAX_PACKETS:
+                # Try to parse incrementally to see if complete
+                try:
+                    # Quick peek: check tails if present
+                    # We don't know order, but if last packet len 6 and tail 58, likely done
+                    if packet[-1] == 58 and len(packets) >= 10:
+                        # Attempt to set complete via full parse
+                        pass
+                except Exception:
+                    pass
+            if len(packets) >= _HISTORY_MAX_PACKETS and not response_future.done():
+                # Assume complete after max packets; let timeout handle otherwise
+                # Don't complete early — wait for timeout to collect all, but we can
+                # complete early if we detect graphs complete via parsing
+                # For now, don't auto-complete; rely on timeout or explicit parse
+                pass
+            # Early complete if we have at least 14 and last is 58
+            if len(packets) >= 14 and packet[-1] == 58 and len(packet) == 6:
+                # Try parsing; if graphs complete, we can finish early
+                # We do a trial parse without side effects to check
+                trial_complete = self._is_history_graphs_complete(packets)
+                if trial_complete and not response_future.done():
+                    response_future.set_result(list(packets))
+
+        subscriptions = await self._async_subscribe_to_notifications(client, _notification_handler)
+
+        try:
+            request_sent = await self._async_send_request(client, ValveRequestCommand.STATUS_AND_HISTORY)
+            if not request_sent:
+                if not response_future.done():
+                    response_future.cancel()
+                return False, False
+            if not subscriptions:
+                if not response_future.done():
+                    response_future.cancel()
+                _LOGGER.debug("Valve %s does not expose notifying characteristic for History", self._address)
+                return True, False
+            try:
+                async with asyncio.timeout(_HISTORY_RESPONSE_TIMEOUT_SECONDS):
+                    # Wait either for early complete or timeout; if no early complete, timeout will fire
+                    # We wait for response_future; if it never completes, timeout triggers
+                    packets_list = await response_future
+            except asyncio.TimeoutError:
+                if not response_future.done():
+                    response_future.cancel()
+                # On timeout, try to parse whatever we collected
+                if not packets:
+                    _LOGGER.debug("Timed out waiting for History response from valve %s (no packets)", self._address)
+                    return True, False
+                packets_list = list(packets)
+                _LOGGER.debug("History timeout for valve %s, collected %d packets, attempting parse", self._address, len(packets_list))
+                # If we have at least stats packet, try parse; otherwise fail
+                if len(packets_list) < 1:
+                    return True, False
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if not response_future.done():
+                    response_future.cancel()
+                _LOGGER.exception("Unexpected error waiting for History response from valve %s", self._address)
+                return True, False
+
+            # Parse collected packets
+            success = self._handle_history_packets(packets_list)
+            return True, success
+        finally:
+            await self._async_unsubscribe_notifications(client, subscriptions)
+
     async def _async_subscribe_to_notifications(
         self,
         client: BaseBleakClient,
@@ -1950,6 +2428,377 @@ class ValveConnection:
 
         return None
 
+    def _get_advanced_settings_packet_index(
+        self, packet: bytes, existing_packets: Mapping[int, bytes]
+    ) -> int | None:
+        """Return the packet index for an Advanced Settings payload."""
+
+        if len(packet) != 20:
+            return None
+        opcode = int(ValveRequestCommand.ADVANCED_SETTINGS)
+        if packet[0] != opcode or packet[1] != opcode:
+            return None
+        index = packet[2]
+        if index not in (0, 1) or index in existing_packets:
+            return None
+        # First packet trailer is 66 ('B'), second has no fixed trailer but
+        # comes only after the first.
+        if index == 0 and packet[19] != 66:
+            return None
+        if index == 1 and 0 not in existing_packets:
+            return None
+        return index
+
+    def _handle_advanced_settings_packets(self, packets: list[bytes]) -> None:
+        """Parse and store the most recent Advanced Settings response."""
+
+        if len(packets) != _ADVANCED_SETTINGS_PACKET_COUNT:
+            _LOGGER.debug(
+                "Valve %s provided incomplete Advanced Settings response (%d of %d packets)",
+                self._address,
+                len(packets),
+                _ADVANCED_SETTINGS_PACKET_COUNT,
+            )
+            return
+        first, second = packets
+        if len(first) != 20 or len(second) != 20:
+            _LOGGER.debug(
+                "Valve %s provided malformed Advanced Settings packet lengths",
+                self._address,
+            )
+            return
+        try:
+            # First packet also carries some general settings, but positions are
+            # the primary interest for regen cycle durations.
+            positions: list[int] = []
+            not_adjustable: list[bool] = []
+            # App stores positions at bytes 3-10 of the second packet.
+            # The high bit (0x80) marks "not adjustable" except for the
+            # salt-dose position (index 4) which is full 0-255 range.
+            # For HA we replicate the Evb019 decoding without salt-dose
+            # special-casing by treating the high bit uniformly; the
+            # underlying value for salt-dose remains 0-255. Detection of
+            # salt-dose is valve-type dependent and is preserved as
+            # information in the position value itself (e.g. 100-199).
+            advertisement = self._advertisement
+            has_salt_dose = False
+            if advertisement is not None:
+                # Metered softeners use position 5 as salt dose (pounds).
+                valve_type = advertisement.valve_type
+                has_salt_dose = valve_type in (
+                    "MeteredSoftener",
+                    "CommercialMeteredSoftener",
+                ) or advertisement.is_twin_valve
+
+            for idx in range(8):
+                raw = second[3 + idx]
+                is_high = bool(raw & 0x80)
+                # Salt dose position (index 4) uses full range; high bit is data.
+                if has_salt_dose and idx == 4:
+                    positions.append(raw & 0xFF)
+                    not_adjustable.append(False)
+                else:
+                    not_adjustable.append(is_high)
+                    if is_high:
+                        # App does packet[i]+128 in signed-byte domain; for
+                        # unsigned raw >127 this would be raw+128 wrapped.
+                        # Since raw already has high bit set, the displayed
+                        # value is the unsigned value (e.g. 0x8A -> 138) but
+                        # semantics are "not adjustable". Preserve raw.
+                        positions.append(raw & 0xFF)
+                    else:
+                        positions.append(raw & 0xFF)
+
+            # Optional fields from first packet (mirroring app)
+            regen_day_override = first[4] & 0xFF
+            reserve_capacity = first[5] & 0xFF
+            # BE: high=packet[7], low=packet[6]
+            resin_grains = ((first[7] & 0xFF) << 8) | (first[6] & 0xFF)
+            air_recharge = first[10] & 0xFF
+
+            data = ValveAdvancedSettingsData(
+                positions=tuple(positions),
+                position_not_adjustable=tuple(not_adjustable),
+                regen_day_override=regen_day_override,
+                reserve_capacity=reserve_capacity,
+                resin_grains_capacity=resin_grains,
+                air_recharge_frequency=air_recharge,
+            )
+        except Exception:  # pragma: no cover
+            _LOGGER.exception(
+                "Error while parsing Advanced Settings response from valve %s",
+                self._address,
+            )
+            return
+        self._advanced_settings_data = data
+        if self._advanced_settings_defaults is None:
+            # Snapshot the first successful read as "defaults" for diagnostics.
+            # The valve has no factory-default packet (the app does not expose one),
+            # so we keep the first poll as a reference value exposed via sensor
+            # attributes. This is read-only; no restore is performed.
+            self._advanced_settings_defaults = data
+            _LOGGER.info(
+                "Valve %s Advanced Settings defaults snapshot captured: %s",
+                self._address,
+                data.positions,
+            )
+        self._notify_advanced_settings_listeners(data)
+
+    def _is_history_graphs_complete(self, packets: list[bytes]) -> bool:
+        """Return True if the collected history packets appear to contain full graphs."""
+
+        # Quick heuristic: need at least stats + 3* tail packets (56,57,58)
+        if len(packets) < 4:
+            return False
+        tails = {p[-1] for p in packets if len(p) in (6, 9)}
+        return 56 in tails and 57 in tails and 58 in tails
+
+    def _handle_history_packets(self, packets: list[bytes]) -> bool:
+        """Parse Status and History packets and store ValveHistoryData. Return True on success."""
+
+        if not packets:
+            return False
+        # Filter to only history opcode
+        history_packets = [p for p in packets if len(p) >= 3 and p[0] == 119 and p[1] == 119]
+        if not history_packets:
+            _LOGGER.debug("Valve %s History: no valid 119 packets in %d", self._address, len(packets))
+            return False
+
+        # Need at least stats packet (b==0)
+        stats = None
+        for p in history_packets:
+            if len(p) >= 3 and p[2] == 0 and len(p) in (17, 19, 20):
+                stats = p
+                break
+        if stats is None:
+            # Fallback: first packet is stats
+            stats = history_packets[0]
+            if len(stats) < 17:
+                _LOGGER.debug("Valve %s History stats packet too short: %s", self._address, stats.hex())
+                return False
+
+        # Use parser that mimics CsStatusAndHistoryPacket counters
+        try:
+            # Helpers matching CsBitUtilities
+            def u8(b: int) -> int:
+                return b & 0xFF
+
+            def get_double_high_low(high: int, low: int) -> float:
+                return float((u8(high) << 8) | u8(low))
+
+            def get_double_high_med_low(high: int, med: int, low: int) -> float:
+                return float((u8(high) << 16) | (u8(med) << 8) | u8(low))
+
+            def is_bit_set(value: int, bit: int) -> bool:
+                return bool((u8(value) >> bit) & 1)
+
+            advertisement = self._advertisement
+            firmware_version = advertisement.firmware_version if advertisement and advertisement.firmware_version is not None else 500
+            is_twin = advertisement.is_twin_valve if advertisement else False
+
+            # --- Stats parsing (packet[2]==0 path) ---
+            # Modern non-classic uses 19 bytes, classic uses variable
+            # For Evb019 we expect 19: [0,1]=119, [2]=0, [3,4]=flow, [5,6,7]=total, [8,9,10]=totalReset, [11,12]=regen, [13,14]=regenReset, [15]=regenActive, [16]=flags, [17]=prefill
+            current_flow = None
+            total_gallons = None
+            total_gallons_resettable = None
+            regen_counter = None
+            regen_counter_resettable = None
+            regen_active = None
+            is_prefill = None
+            shutoff_setting = None
+            bypass_setting = None
+            shutoff_state = None
+            bypass_state = None
+            display_off = None
+
+            if len(stats) >= 17:
+                # Use firmness length check like Java: >=19 for modern, else 17
+                if len(stats) >= 19 or (len(stats) >= 17 and firmware_version <= 210 and not is_twin):
+                    try:
+                        current_flow = get_double_high_low(stats[4], stats[3]) / 100.0
+                        total_gallons = int(get_double_high_med_low(stats[7], stats[6], stats[5]))
+                        total_gallons_resettable = int(get_double_high_med_low(stats[10], stats[9], stats[8]))
+                        regen_counter = int(get_double_high_low(stats[12], stats[11]))
+                        regen_counter_resettable = int(get_double_high_low(stats[14], stats[13]))
+                        regen_active = u8(stats[15])
+                        if firmware_version >= 410 or is_twin:
+                            flags = u8(stats[16])
+                            shutoff_setting = is_bit_set(flags, 1)
+                            bypass_setting = is_bit_set(flags, 2)
+                            shutoff_state = is_bit_set(flags, 3)
+                            bypass_state = is_bit_set(flags, 4)
+                            display_off = is_bit_set(flags, 5)
+                        if firmware_version >= 210 or is_twin:
+                            if len(stats) > 17:
+                                is_prefill = (u8(stats[17]) & 8) != 0
+                    except Exception:
+                        _LOGGER.exception("Error parsing History stats for valve %s", self._address)
+
+            # --- Graph parsing ---
+            # Initialize arrays
+            water_day = [0.0] * 62
+            water_regen = [0.0] * 42
+            peak_flow = [0.0] * 62
+            # Counters
+            day_counter = 0
+            regen_counter_pkt = 0
+            peak_counter = 0
+            day_complete = False
+            regen_complete = False
+            peak_complete = False
+
+            # Helper to fill day
+            def set_day(packet: bytes, start: int, end: int, offset: int) -> None:
+                nonlocal day_counter
+                day_counter += 1
+                if day_complete:
+                    return
+                for idx in range(start, end):
+                    off = idx + offset
+                    if 0 <= off < 62:
+                        water_day[off] = float(u8(packet[idx]) * 10.0)
+
+            def set_regen(packet: bytes, start: int, end: int, offset: int, initial: bool) -> None:
+                nonlocal regen_counter_pkt
+                regen_counter_pkt += 1
+                if regen_complete:
+                    return
+                i = start
+                while i < end:
+                    # initial uses (start+offset)/2, else start/2+offset
+                    if initial:
+                        off = (i + offset) // 2
+                    else:
+                        off = (i // 2) + offset
+                    if 0 <= off < 42 and i + 1 < len(packet):
+                        val = (u8(packet[i]) * 256) + u8(packet[i + 1])
+                        water_regen[off] = float(val)
+                    i += 2
+
+            def set_peak(packet: bytes, start: int, end: int, offset: int) -> None:
+                nonlocal peak_counter
+                peak_counter += 1
+                if peak_complete:
+                    return
+                for idx in range(start, end):
+                    off = idx + offset
+                    if 0 <= off < 62:
+                        peak_flow[off] = float(u8(packet[idx]) * 10.0 / 100.0)
+
+            # Feed packets in received order, mimicking Java's updatePacket state machine
+            # First, handle initial b==1,2,3 packets when counters==0
+            # Then handle continuation counters.
+            # We replicate Java's two-phase logic: first phase handles b==0..3 when counters zero,
+            # second phase handles counter-based continuation.
+            # Simplify: iterate packets sequentially and apply Java logic.
+            for pkt in history_packets:
+                if len(pkt) < 3:
+                    continue
+                b = u8(pkt[2])
+                # Phase 1: counters zero check
+                if (day_counter == 0 or day_counter > 3) and (regen_counter_pkt == 0 or regen_counter_pkt > 4) and (peak_counter == 0 or peak_counter > 3):
+                    if b == 0:
+                        continue  # stats already handled
+                    if b == 1 and len(pkt) == 20:
+                        set_day(pkt, 3, 20, -3)
+                        continue
+                    if b == 2 and len(pkt) == 20 and len(pkt) > 3 and u8(pkt[3]) == 68:
+                        set_regen(pkt, 4, 20, -4, True)
+                        continue
+                    if b == 3 and len(pkt) == 20:
+                        set_peak(pkt, 3, 20, -3)
+                        continue
+                    # fallback
+                # Phase 2: day continuation
+                if day_counter > 0 and not day_complete:
+                    if day_counter == 1 and len(pkt) == 20:
+                        set_day(pkt, 0, 20, 17)
+                        continue
+                    if day_counter == 2 and len(pkt) == 20:
+                        set_day(pkt, 0, 20, 37)
+                        continue
+                    if day_counter == 3 and len(pkt) == 6:
+                        set_day(pkt, 0, 5, 57)
+                        if len(pkt) > 5 and u8(pkt[5]) == 56:
+                            day_complete = True
+                        continue
+                if regen_counter_pkt > 0 and not regen_complete:
+                    if regen_counter_pkt == 1 and len(pkt) == 20:
+                        set_regen(pkt, 0, 20, 8, False)
+                        continue
+                    if regen_counter_pkt == 2 and len(pkt) == 20:
+                        set_regen(pkt, 0, 20, 18, False)
+                        continue
+                    if regen_counter_pkt == 3 and len(pkt) == 20:
+                        set_regen(pkt, 0, 20, 28, False)
+                        continue
+                    if regen_counter_pkt == 4 and len(pkt) == 9:
+                        set_regen(pkt, 0, 8, 38, False)
+                        if len(pkt) > 8 and u8(pkt[8]) == 57:
+                            regen_complete = True
+                        continue
+                if peak_counter > 0 and not peak_complete:
+                    if peak_counter == 1 and len(pkt) == 20:
+                        set_peak(pkt, 0, 20, 17)
+                        continue
+                    if peak_counter == 2 and len(pkt) == 20:
+                        set_peak(pkt, 0, 20, 37)
+                        continue
+                    if peak_counter == 3 and len(pkt) == 6:
+                        set_peak(pkt, 0, 5, 57)
+                        if len(pkt) > 5 and u8(pkt[5]) == 58:
+                            peak_complete = True
+                            # Java resets counters and marks graphs complete here
+                            day_counter = 0
+                            regen_counter_pkt = 0
+                            peak_counter = 0
+                        continue
+
+            # Fallback heuristic: if we didn't get complete flags but have enough data,
+            # assume complete if we collected at least 10 packets
+            graphs_complete = day_complete and regen_complete and peak_complete
+            # If not complete, but we have data, still store what we have (best effort)
+            # Only consider success if at least stats parsed or some graph data non-zero
+            has_graph_data = any(v != 0 for v in water_day) or any(v != 0 for v in water_regen) or any(v != 0 for v in peak_flow)
+            data = ValveHistoryData(
+                current_water_flow=current_flow,
+                total_gallons=total_gallons,
+                total_gallons_resettable=total_gallons_resettable,
+                regen_counter=regen_counter,
+                regen_counter_resettable=regen_counter_resettable,
+                regen_active=regen_active,
+                is_prefill_soak_mode=is_prefill,
+                shutoff_setting=shutoff_setting,
+                bypass_setting=bypass_setting,
+                shutoff_state=shutoff_state,
+                bypass_state=bypass_state,
+                display_off=display_off,
+                water_usage_day=tuple(water_day) if has_graph_data or True else None,
+                water_usage_regen=tuple(water_regen) if has_graph_data or True else None,
+                peak_flow=tuple(peak_flow) if has_graph_data or True else None,
+            )
+            # Consider success if stats at least present
+            success = total_gallons is not None or has_graph_data
+            if success:
+                self._history_data = data
+                self._notify_history_listeners(data)
+                _LOGGER.info("Valve %s History parsed: total=%s regen=%s flow=%s graphs_complete=%s", self._address, total_gallons, regen_counter, current_flow, graphs_complete)
+                return True
+            else:
+                _LOGGER.debug("Valve %s History parse failed: no valid data in %d packets", self._address, len(history_packets))
+                return False
+        except Exception:
+            _LOGGER.exception("Error while parsing History response from valve %s", self._address)
+            return False
+
+    def _notify_history_listeners(self, data: ValveHistoryData | None) -> None:
+        for listener in list(self._history_listeners):
+            try:
+                listener(data)
+            except Exception:
+                _LOGGER.exception("Unexpected error in History listener for valve %s", self._address)
+
     def _handle_dashboard_packets(self, packets: list[bytes]) -> None:
         """Parse and store the most recent Dashboard response from the valve."""
 
@@ -2064,6 +2913,20 @@ class ValveConnection:
             except Exception:  # pragma: no cover - listener failures are logged
                 _LOGGER.exception(
                     "Unexpected error in Dashboard listener for valve %s", self._address
+                )
+
+    def _notify_advanced_settings_listeners(
+        self, data: ValveAdvancedSettingsData | None
+    ) -> None:
+        """Notify registered callbacks about Advanced Settings updates."""
+
+        for listener in list(self._advanced_settings_listeners):
+            try:
+                listener(data)
+            except Exception:  # pragma: no cover
+                _LOGGER.exception(
+                    "Unexpected error in Advanced Settings listener for valve %s",
+                    self._address,
                 )
 
     def _notify_authentication_listeners(self) -> None:
@@ -2333,6 +3196,8 @@ class ValveConnectionManager:
         self._connections: dict[str, ValveConnection] = {}
         self._remove_listener: CALLBACK_TYPE | None = None
         self._cancel_interval: CALLBACK_TYPE | None = None
+        self._cancel_advanced_interval: CALLBACK_TYPE | None = None
+        self._cancel_history_interval: CALLBACK_TYPE | None = None
         self._startup_unsub: CALLBACK_TYPE | None = None
 
     async def async_setup(self) -> None:
@@ -2342,12 +3207,22 @@ class ValveConnectionManager:
             connection = self._ensure_connection(advertisement)
             if self._hass.state == CoreState.running:
                 connection.schedule_poll()
+                # Also kick off separate advanced/history fetches shortly after setup
+                # (staggered so dashboard wins first connection)
+                self._hass.loop.call_later(5, connection.schedule_advanced_settings_poll)
+                self._hass.loop.call_later(15, connection.schedule_history_poll)
 
         self._remove_listener = self._discovery_manager.async_add_listener(
             self._handle_discovery_event
         )
         self._cancel_interval = async_track_time_interval(
             self._hass, self._handle_poll_interval, CONNECTION_POLL_INTERVAL
+        )
+        self._cancel_advanced_interval = async_track_time_interval(
+            self._hass, self._handle_advanced_poll_interval, _ADVANCED_SETTINGS_POLL_INTERVAL
+        )
+        self._cancel_history_interval = async_track_time_interval(
+            self._hass, self._handle_history_poll_interval, _HISTORY_POLL_INTERVAL
         )
 
         if self._hass.state != CoreState.running:
@@ -2366,6 +3241,14 @@ class ValveConnectionManager:
             self._cancel_interval()
             self._cancel_interval = None
 
+        if self._cancel_advanced_interval is not None:
+            self._cancel_advanced_interval()
+            self._cancel_advanced_interval = None
+
+        if self._cancel_history_interval is not None:
+            self._cancel_history_interval()
+            self._cancel_history_interval = None
+
         if self._startup_unsub is not None:
             self._startup_unsub()
             self._startup_unsub = None
@@ -2383,10 +3266,24 @@ class ValveConnectionManager:
 
     @callback
     def _handle_poll_interval(self, _: datetime) -> None:
-        """Poll each known valve on a fixed schedule."""
+        """Poll each known valve on a fixed schedule (dashboard only)."""
 
         for connection in self._connections.values():
             connection.schedule_poll()
+
+    @callback
+    def _handle_advanced_poll_interval(self, _: datetime) -> None:
+        """Poll Advanced Settings (118) on its own infrequent schedule."""
+
+        for connection in self._connections.values():
+            connection.schedule_advanced_settings_poll()
+
+    @callback
+    def _handle_history_poll_interval(self, _: datetime) -> None:
+        """Poll Status and History (119) on its own infrequent schedule."""
+
+        for connection in self._connections.values():
+            connection.schedule_history_poll()
 
     async def _handle_home_assistant_started(self, _: object) -> None:
         """Trigger an initial poll once Home Assistant startup completes."""
@@ -2394,6 +3291,8 @@ class ValveConnectionManager:
         self._startup_unsub = None
         for connection in self._connections.values():
             connection.schedule_poll()
+            self._hass.loop.call_later(5, connection.schedule_advanced_settings_poll)
+            self._hass.loop.call_later(15, connection.schedule_history_poll)
 
     @callback
     def _handle_discovery_event(
@@ -2409,6 +3308,11 @@ class ValveConnectionManager:
 
         connection = self._ensure_connection(advertisement)
         connection.schedule_poll()
+        # Stagger infrequent fetches only if we have no data yet (avoids hammering on every advertisement)
+        if connection.advanced_settings_data is None:
+            self._hass.loop.call_later(5, connection.schedule_advanced_settings_poll)
+        if connection.history_data is None:
+            self._hass.loop.call_later(15, connection.schedule_history_poll)
 
     def _ensure_connection(self, advertisement: ValveAdvertisement) -> ValveConnection:
         """Return the connection handler for an advertisement's address."""

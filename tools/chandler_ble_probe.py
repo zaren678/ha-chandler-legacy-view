@@ -28,6 +28,8 @@ except ImportError:
 
 DEVICE_LIST = 116
 DASHBOARD = 117
+ADVANCED_SETTINGS = 118
+STATUS_AND_HISTORY = 119
 RESET = 114
 PACKET_LENGTH = 20
 AUTHENTICATED = 128
@@ -409,30 +411,46 @@ async def run_probe(args: argparse.Namespace, journal: Journal) -> None:
                 )
                 return
 
-            while not queue.empty():
-                queue.get_nowait()
-            await send("Dashboard", request_payload(DASHBOARD))
-            deadline = time.monotonic() + args.dashboard_seconds
-            dashboard_packets = 0
-            while time.monotonic() < deadline:
-                try:
-                    _, packet = await asyncio.wait_for(
-                        queue.get(), timeout=deadline - time.monotonic()
+            async def capture_request(
+                label: str, command: int, duration: float
+            ) -> None:
+                while not queue.empty():
+                    queue.get_nowait()
+                await send(label, request_payload(command))
+                deadline = time.monotonic() + duration
+                packets = 0
+                while time.monotonic() < deadline:
+                    try:
+                        _, packet = await asyncio.wait_for(
+                            queue.get(), timeout=deadline - time.monotonic()
+                        )
+                    except asyncio.TimeoutError:
+                        break
+                    packets += 1
+                    event_name = label.casefold().replace(" ", "_")
+                    journal.record(
+                        f"{event_name}_packet",
+                        f"{label} packet {packets}: {packet.hex()}",
+                        packet_number=packets,
+                        length=len(packet),
+                        hex=packet.hex(),
                     )
-                except asyncio.TimeoutError:
-                    break
-                dashboard_packets += 1
                 journal.record(
-                    "dashboard_packet",
-                    f"Dashboard packet {dashboard_packets}: {packet.hex()}",
-                    packet_number=dashboard_packets,
-                    length=len(packet),
-                    hex=packet.hex(),
+                    f"{label.casefold().replace(' ', '_')}_summary",
+                    f"Received {packets} {label} notification packet(s)",
+                    packet_count=packets,
                 )
-            journal.record(
-                "dashboard_summary",
-                f"Received {dashboard_packets} Dashboard notification packet(s)",
-                packet_count=dashboard_packets,
+
+            await capture_request("Dashboard", DASHBOARD, args.dashboard_seconds)
+            await capture_request(
+                "Advanced Settings",
+                ADVANCED_SETTINGS,
+                args.advanced_settings_seconds,
+            )
+            await capture_request(
+                "Status and History",
+                STATUS_AND_HISTORY,
+                args.history_seconds,
             )
         finally:
             try:
@@ -457,6 +475,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--connect-timeout", type=float, default=20.0)
     parser.add_argument("--response-timeout", type=float, default=6.0)
     parser.add_argument("--dashboard-seconds", type=float, default=8.0)
+    parser.add_argument("--advanced-settings-seconds", type=float, default=8.0)
+    parser.add_argument("--history-seconds", type=float, default=12.0)
     parser.add_argument("--auth-attempts", type=int, default=1)
     parser.add_argument(
         "--include-auth-payload",

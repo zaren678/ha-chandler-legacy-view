@@ -23,6 +23,7 @@ from homeassistant.const import (
 # constant, so we keep using the unit string Chandler devices report.
 WATER_HARDNESS_GRAINS_PER_GALLON = "grains_per_gallon"
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DATA_CONNECTION_MANAGER, DATA_DISCOVERY_MANAGER, DOMAIN
@@ -31,7 +32,12 @@ from .cycle import cycle_phase, cycle_remaining_seconds
 from .dashboard import format_time_of_day
 from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
 from .entity import ChandlerValveEntity, _is_clack_valve
-from .models import ValveAdvertisement, ValveDashboardData
+from .models import (
+    ValveAdvancedSettingsData,
+    ValveAdvertisement,
+    ValveDashboardData,
+    ValveHistoryData,
+)
 from .regeneration import regeneration_is_active
 
 _LOGGER = logging.getLogger(__name__)
@@ -429,6 +435,319 @@ class ValveCycleStateSensor(ValveDashboardSensor):
         }
 
 
+class ValveRegenPositionSensor(ChandlerValveEntity, SensorEntity):
+    """Expose a single regen cycle stage duration from Advanced Settings (read-only)."""
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(
+        self,
+        advertisement: ValveAdvertisement,
+        connection: ValveConnection,
+        position_index: int,
+    ) -> None:
+        super().__init__(advertisement)
+        self._connection = connection
+        self._position_index = position_index  # 0-based, P1..P8 maps to 49-56
+        self._attr_unique_id = f"{advertisement.address}_regen_pos_{position_index+1}"
+        self._attr_name = f"{self._attr_name} Regen Position {position_index+1}"
+        self._attr_available = False
+        self._advanced_data: ValveAdvancedSettingsData | None = (
+            connection.advanced_settings_data
+        )
+        self._is_evb019 = advertisement.model in (None, "Evb019")
+        self._remove_listener: CALLBACK_TYPE | None = (
+            connection.add_advanced_settings_listener(self._handle_advanced_update)
+        )
+        self._update_from_advanced_data(self._advanced_data)
+
+    def _is_salt_dose(self) -> bool:
+        adv = self._advertisement
+        if adv is None:
+            return False
+        return (
+            adv.valve_type in ("MeteredSoftener", "CommercialMeteredSoftener")
+            or adv.is_twin_valve
+        ) and self._position_index == 4
+
+    def _update_from_advanced_data(
+        self, data: ValveAdvancedSettingsData | None
+    ) -> None:
+        self._advanced_data = data
+        if not self._is_evb019:
+            self._attr_available = False
+            self._attr_native_value = None
+            return
+        if data is None or len(data.positions) <= self._position_index:
+            self._attr_available = False
+            self._attr_native_value = None
+            return
+        # Read-only sensor: always available when data exists; adjustability is
+        # exposed via `not_adjustable` attribute only.
+        self._attr_available = True
+        is_salt = self._is_salt_dose()
+        if is_salt:
+            self._attr_native_unit_of_measurement = "lb"
+        else:
+            self._attr_native_unit_of_measurement = UnitOfTime.MINUTES
+        self._attr_native_value = data.positions[self._position_index]
+
+    @callback
+    def _handle_advanced_update(
+        self, data: ValveAdvancedSettingsData | None
+    ) -> None:
+        self._update_from_advanced_data(data)
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+    @callback
+    def async_handle_bluetooth_update(
+        self, advertisement: ValveAdvertisement, change: BluetoothChange
+    ) -> None:
+        if change in BLUETOOTH_LOST_CHANGES:
+            self._attr_available = False
+        else:
+            self.async_update_from_advertisement(advertisement)
+            self._is_evb019 = advertisement.model in (None, "Evb019")
+            self._update_from_advanced_data(self._connection.advanced_settings_data)
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+    def async_update_from_advertisement(
+        self, advertisement: ValveAdvertisement
+    ) -> None:
+        super().async_update_from_advertisement(advertisement)
+        self._attr_name = f"{self._attr_name} Regen Position {self._position_index+1}"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        data = self._connection.advanced_settings_data
+        defaults = self._connection.advanced_settings_defaults
+        attrs: dict[str, object] = {
+            "position_index": self._position_index + 1,
+        }
+        if data is not None and len(data.positions) > self._position_index:
+            attrs["position_value"] = data.positions[self._position_index]
+        else:
+            attrs["position_value"] = None
+        if defaults is not None and len(defaults.positions) > self._position_index:
+            attrs["default_value"] = defaults.positions[self._position_index]
+        if data is not None and len(data.position_not_adjustable) > self._position_index:
+            attrs["not_adjustable"] = data.position_not_adjustable[self._position_index]
+        return attrs
+
+    async def async_will_remove_from_hass(self) -> None:
+        await super().async_will_remove_from_hass()
+        if self._remove_listener is not None:
+            remover = self._remove_listener  # type: ignore[attr-defined]
+            try:
+                remover()  # type: ignore[call-arg]
+            except Exception:
+                pass
+            self._remove_listener = None
+
+
+class ValveHistorySensor(ChandlerValveEntity, SensorEntity):
+    """Base for sensors driven by Status and History (119) — read-only, separate poll."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(
+        self,
+        advertisement: ValveAdvertisement,
+        connection: ValveConnection,
+        *,
+        unique_id_suffix: str,
+        name_suffix: str | None,
+    ) -> None:
+        super().__init__(advertisement)
+        self._connection = connection
+        base_name = self._attr_name
+        self._attr_unique_id = f"{advertisement.address}_{unique_id_suffix}"
+        self._name_suffix = name_suffix
+        self._remove_history_listener: CALLBACK_TYPE | None = None
+        self._attr_name = self._apply_name_suffix(base_name, advertisement)
+        self._is_evb019 = advertisement.model in (None, "Evb019")
+        self._attr_available = False
+        self._update_from_history(connection.history_data, write_state=False)
+        self._remove_history_listener = connection.add_history_listener(self._handle_history_update)
+
+    def _apply_name_suffix(self, base_name: str, advertisement: ValveAdvertisement) -> str:
+        suffix = self._get_name_suffix(advertisement)
+        if suffix:
+            return f"{base_name} {suffix}"
+        return base_name
+
+    def _get_name_suffix(self, advertisement: ValveAdvertisement) -> str | None:
+        return self._name_suffix
+
+    @callback
+    def async_handle_bluetooth_update(self, advertisement: ValveAdvertisement, change: BluetoothChange) -> None:
+        if change in BLUETOOTH_LOST_CHANGES:
+            self._attr_available = False
+        else:
+            self.async_update_from_advertisement(advertisement)
+            self._is_evb019 = advertisement.model in (None, "Evb019")
+            self._update_from_history(self._connection.history_data, write_state=False)
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+    def async_update_from_advertisement(self, advertisement: ValveAdvertisement) -> None:
+        super().async_update_from_advertisement(advertisement)
+        base_name = self._attr_name
+        self._attr_name = self._apply_name_suffix(base_name, advertisement)
+
+    async def async_will_remove_from_hass(self) -> None:
+        await super().async_will_remove_from_hass()
+        if self._remove_history_listener is not None:
+            self._remove_history_listener()
+            self._remove_history_listener = None
+
+    def _update_from_history(self, data: ValveHistoryData | None, *, write_state: bool) -> None:
+        self._attr_native_value = self._extract_native_value(data)
+        # History is infrequent; mark unavailable until first successful fetch
+        if not self._is_evb019:
+            self._attr_available = False
+        elif data is None or self._attr_native_value is None:
+            self._attr_available = False
+        else:
+            self._attr_available = True
+        if write_state and self.hass is not None:
+            self.async_write_ha_state()
+
+    def _extract_native_value(self, data: ValveHistoryData | None) -> object | None:
+        raise NotImplementedError
+
+    @callback
+    def _handle_history_update(self, data: ValveHistoryData | None) -> None:
+        self._update_from_history(data, write_state=True)
+
+
+class ValveHistoryTotalGallonsSensor(ValveHistorySensor):
+    """Total gallons from History (lifetime, not resettable)."""
+
+    _attr_native_unit_of_measurement = UnitOfVolume.GALLONS
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+
+    def __init__(self, advertisement: ValveAdvertisement, connection: ValveConnection) -> None:
+        self._connection = connection
+        super().__init__(advertisement, connection, unique_id_suffix="history_total_gallons", name_suffix="History Total Gallons")
+
+    def _extract_native_value(self, data: ValveHistoryData | None) -> int | None:
+        return data.total_gallons if data else None
+
+
+class ValveHistoryTotalGallonsResettableSensor(ValveHistorySensor):
+    """Total gallons resettable from History."""
+
+    _attr_native_unit_of_measurement = UnitOfVolume.GALLONS
+    _attr_state_class = SensorStateClass.TOTAL
+
+    def __init__(self, advertisement: ValveAdvertisement, connection: ValveConnection) -> None:
+        self._connection = connection
+        super().__init__(advertisement, connection, unique_id_suffix="history_total_gallons_resettable", name_suffix="History Total Gallons Resettable")
+
+    def _extract_native_value(self, data: ValveHistoryData | None) -> int | None:
+        return data.total_gallons_resettable if data else None
+
+
+class ValveHistoryRegenCounterSensor(ValveHistorySensor):
+    """Regen count from History (lifetime)."""
+
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+
+    def __init__(self, advertisement: ValveAdvertisement, connection: ValveConnection) -> None:
+        self._connection = connection
+        super().__init__(advertisement, connection, unique_id_suffix="history_regen_counter", name_suffix="History Regen Count")
+
+    def _extract_native_value(self, data: ValveHistoryData | None) -> int | None:
+        return data.regen_counter if data else None
+
+
+class ValveHistoryRegenCounterResettableSensor(ValveHistorySensor):
+    """Regen count resettable from History."""
+
+    _attr_state_class = SensorStateClass.TOTAL
+
+    def __init__(self, advertisement: ValveAdvertisement, connection: ValveConnection) -> None:
+        self._connection = connection
+        super().__init__(advertisement, connection, unique_id_suffix="history_regen_counter_resettable", name_suffix="History Regen Count Resettable")
+
+    def _extract_native_value(self, data: ValveHistoryData | None) -> int | None:
+        return data.regen_counter_resettable if data else None
+
+
+class ValveHistoryWaterUsageDaySensor(ValveHistorySensor):
+    """Exposes History water usage day graph (62 days) as attributes; state is latest day."""
+
+    _attr_native_unit_of_measurement = UnitOfVolume.GALLONS
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, advertisement: ValveAdvertisement, connection: ValveConnection) -> None:
+        self._connection = connection
+        super().__init__(advertisement, connection, unique_id_suffix="history_water_usage_day", name_suffix="History Water Usage Day")
+
+    def _extract_native_value(self, data: ValveHistoryData | None) -> float | None:
+        if data and data.water_usage_day:
+            # Latest (most recent) is last element after parsing
+            return float(data.water_usage_day[-1])
+        return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        data = self._connection.history_data if hasattr(self, "_connection") else None
+        if data and data.water_usage_day:
+            return {"water_usage_day": list(data.water_usage_day), "days": len(data.water_usage_day)}
+        return {}
+
+
+class ValveHistoryWaterUsageRegenSensor(ValveHistorySensor):
+    """Per-regen water usage graph (42 regens) — state is latest regen."""
+
+    _attr_native_unit_of_measurement = UnitOfVolume.GALLONS
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, advertisement: ValveAdvertisement, connection: ValveConnection) -> None:
+        self._connection = connection
+        super().__init__(advertisement, connection, unique_id_suffix="history_water_usage_regen", name_suffix="History Water Usage Per Regen")
+
+    def _extract_native_value(self, data: ValveHistoryData | None) -> float | None:
+        if data and data.water_usage_regen:
+            return float(data.water_usage_regen[-1])
+        return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        data = self._connection.history_data if hasattr(self, "_connection") else None
+        if data and data.water_usage_regen:
+            return {"water_usage_regen": list(data.water_usage_regen), "count": len(data.water_usage_regen)}
+        return {}
+
+
+class ValveHistoryPeakFlowSensor(ValveHistorySensor):
+    """Peak flow history graph (62 days) — state is latest peak."""
+
+    _attr_native_unit_of_measurement = UnitOfVolumeFlowRate.GALLONS_PER_MINUTE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, advertisement: ValveAdvertisement, connection: ValveConnection) -> None:
+        self._connection = connection
+        super().__init__(advertisement, connection, unique_id_suffix="history_peak_flow", name_suffix="History Peak Flow")
+
+    def _extract_native_value(self, data: ValveHistoryData | None) -> float | None:
+        if data and data.peak_flow:
+            return float(data.peak_flow[-1])
+        return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        data = self._connection.history_data if hasattr(self, "_connection") else None
+        if data and data.peak_flow:
+            return {"peak_flow": list(data.peak_flow), "days": len(data.peak_flow)}
+        return {}
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -450,6 +769,14 @@ async def async_setup_entry(
     peak_entities: dict[str, ValvePeakFlowTodaySensor] = {}
     cycle_entities: dict[str, ValveCycleStateSensor] = {}
     remaining_entities: dict[str, ValveCycleRemainingSensor] = {}
+    regen_position_entities: dict[str, list[ValveRegenPositionSensor]] = {}
+    history_total_entities: dict[str, ValveHistoryTotalGallonsSensor] = {}
+    history_total_reset_entities: dict[str, ValveHistoryTotalGallonsResettableSensor] = {}
+    history_regen_entities: dict[str, ValveHistoryRegenCounterSensor] = {}
+    history_regen_reset_entities: dict[str, ValveHistoryRegenCounterResettableSensor] = {}
+    history_day_entities: dict[str, ValveHistoryWaterUsageDaySensor] = {}
+    history_regen_usage_entities: dict[str, ValveHistoryWaterUsageRegenSensor] = {}
+    history_peak_entities: dict[str, ValveHistoryPeakFlowSensor] = {}
 
     def _ensure_dashboard_entity(
         advertisement: ValveAdvertisement,
@@ -585,6 +912,70 @@ async def async_setup_entry(
             debug_description="cycle remaining",
         )
 
+    def _ensure_regen_position_entities(
+        advertisement: ValveAdvertisement,
+    ) -> list[ValveRegenPositionSensor]:
+        # Only Evb019 supports Advanced Settings position buffers; gate by model
+        if advertisement.model not in (None, "Evb019"):
+            return []
+        existing = regen_position_entities.get(advertisement.address)
+        if existing is not None:
+            return []
+        connection = connection_manager.get_connection(advertisement.address)
+        if connection is None:
+            _LOGGER.debug(
+                "Delaying regen position sensor creation for %s; connection not ready",
+                advertisement.address,
+            )
+            return []
+        created: list[ValveRegenPositionSensor] = []
+        for idx in range(8):
+            ent = ValveRegenPositionSensor(advertisement, connection, idx)
+            created.append(ent)
+        regen_position_entities[advertisement.address] = created
+        return created
+
+    def _ensure_history_entity(
+        advertisement: ValveAdvertisement,
+        entity_map: dict[str, ValveHistorySensor],
+        factory: Callable[[ValveAdvertisement, ValveConnection], ValveHistorySensor],
+        debug_description: str,
+    ) -> tuple[ValveHistorySensor | None, list[ValveHistorySensor]]:
+        if advertisement.model not in (None, "Evb019"):
+            return None, []
+        entity = entity_map.get(advertisement.address)
+        new_entities: list[ValveHistorySensor] = []
+        if entity is None:
+            connection = connection_manager.get_connection(advertisement.address)
+            if connection is None:
+                _LOGGER.debug("Delaying %s sensor creation for %s; connection not ready", debug_description, advertisement.address)
+                return None, new_entities
+            entity = factory(advertisement, connection)
+            entity_map[advertisement.address] = entity
+            new_entities.append(entity)
+        return entity, new_entities
+
+    def _ensure_history_total_entity(advertisement: ValveAdvertisement) -> tuple[ValveHistorySensor | None, list[ValveHistorySensor]]:
+        return _ensure_history_entity(advertisement, history_total_entities, lambda adv, conn: ValveHistoryTotalGallonsSensor(adv, conn), "history total gallons")
+
+    def _ensure_history_total_reset_entity(advertisement: ValveAdvertisement) -> tuple[ValveHistorySensor | None, list[ValveHistorySensor]]:
+        return _ensure_history_entity(advertisement, history_total_reset_entities, lambda adv, conn: ValveHistoryTotalGallonsResettableSensor(adv, conn), "history total resettable")
+
+    def _ensure_history_regen_entity(advertisement: ValveAdvertisement) -> tuple[ValveHistorySensor | None, list[ValveHistorySensor]]:
+        return _ensure_history_entity(advertisement, history_regen_entities, lambda adv, conn: ValveHistoryRegenCounterSensor(adv, conn), "history regen counter")
+
+    def _ensure_history_regen_reset_entity(advertisement: ValveAdvertisement) -> tuple[ValveHistorySensor | None, list[ValveHistorySensor]]:
+        return _ensure_history_entity(advertisement, history_regen_reset_entities, lambda adv, conn: ValveHistoryRegenCounterResettableSensor(adv, conn), "history regen resettable")
+
+    def _ensure_history_day_entity(advertisement: ValveAdvertisement) -> tuple[ValveHistorySensor | None, list[ValveHistorySensor]]:
+        return _ensure_history_entity(advertisement, history_day_entities, lambda adv, conn: ValveHistoryWaterUsageDaySensor(adv, conn), "history water day")
+
+    def _ensure_history_regen_usage_entity(advertisement: ValveAdvertisement) -> tuple[ValveHistorySensor | None, list[ValveHistorySensor]]:
+        return _ensure_history_entity(advertisement, history_regen_usage_entities, lambda adv, conn: ValveHistoryWaterUsageRegenSensor(adv, conn), "history water regen")
+
+    def _ensure_history_peak_entity(advertisement: ValveAdvertisement) -> tuple[ValveHistorySensor | None, list[ValveHistorySensor]]:
+        return _ensure_history_entity(advertisement, history_peak_entities, lambda adv, conn: ValveHistoryPeakFlowSensor(adv, conn), "history peak flow")
+
     EnsureCallback = Callable[
         [ValveAdvertisement],
         tuple[ValveDashboardSensor | None, list[ValveDashboardSensor]],
@@ -603,11 +994,30 @@ async def async_setup_entry(
         _ensure_remaining_entity,
     )
 
+    EnsureHistoryCallback = Callable[
+        [ValveAdvertisement],
+        tuple[ValveHistorySensor | None, list[ValveHistorySensor]],
+    ]
+
+    ensure_history_callbacks: tuple[EnsureHistoryCallback, ...] = (
+        _ensure_history_total_entity,
+        _ensure_history_total_reset_entity,
+        _ensure_history_regen_entity,
+        _ensure_history_regen_reset_entity,
+        _ensure_history_day_entity,
+        _ensure_history_regen_usage_entity,
+        _ensure_history_peak_entity,
+    )
+
     initial_entities: list[SensorEntity] = []
     for advertisement in discovery_manager.devices.values():
         for ensure_callback in ensure_callbacks:
             _, created = ensure_callback(advertisement)
             initial_entities.extend(created)
+        for ensure_cb in ensure_history_callbacks:
+            _, created = ensure_cb(advertisement)
+            initial_entities.extend(created)
+        initial_entities.extend(_ensure_regen_position_entities(advertisement))
 
     if initial_entities:
         async_add_entities(initial_entities)
@@ -624,6 +1034,15 @@ async def async_setup_entry(
         cycle_entities,
         remaining_entities,
     )
+    history_entity_maps = (
+        history_total_entities,
+        history_total_reset_entities,
+        history_regen_entities,
+        history_regen_reset_entities,
+        history_day_entities,
+        history_regen_usage_entities,
+        history_peak_entities,
+    )
 
     @callback
     def _handle_discovery(
@@ -634,13 +1053,24 @@ async def async_setup_entry(
                 entity = entity_map.get(advertisement.address)
                 if entity is not None:
                     entity.async_handle_bluetooth_update(advertisement, change)
+            for entity_map in history_entity_maps:
+                entity = entity_map.get(advertisement.address)
+                if entity is not None:
+                    entity.async_handle_bluetooth_update(advertisement, change)
+            for ent in regen_position_entities.get(advertisement.address, []):
+                ent.async_handle_bluetooth_update(advertisement, change)
             return
 
         results = [ensure_callback(advertisement) for ensure_callback in ensure_callbacks]
+        history_results = [ensure_cb(advertisement) for ensure_cb in ensure_history_callbacks]
 
         new_entities: list[SensorEntity] = []
         for _, created in results:
             new_entities.extend(created)
+        for _, created in history_results:
+            new_entities.extend(created)
+        new_regen = _ensure_regen_position_entities(advertisement)
+        new_entities.extend(new_regen)
 
         if new_entities:
             async_add_entities(new_entities)
@@ -648,6 +1078,11 @@ async def async_setup_entry(
         for entity, _ in results:
             if entity is not None:
                 entity.async_handle_bluetooth_update(advertisement, change)
+        for entity, _ in history_results:
+            if entity is not None:
+                entity.async_handle_bluetooth_update(advertisement, change)
+        for ent in regen_position_entities.get(advertisement.address, []):
+            ent.async_handle_bluetooth_update(advertisement, change)
 
     remove_listener = discovery_manager.async_add_listener(_handle_discovery)
     entry.async_on_unload(remove_listener)
