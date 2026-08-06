@@ -6,37 +6,24 @@ The integration listens for Bluetooth advertisements emitted by supported
 valves, recognises them by their signatures, and surfaces their presence inside
 Home Assistant as entities that can participate in automations or dashboards.
 
+## Supported devices
+
+* **Evb019 (firmware < 600, e.g. `CS_Aeration_Fltr`) — full read-only parity:** device-list auth, dashboard, Advanced Settings, Status & History, cycle/error diagnostics. All 3 BLE requests run on separate schedules so dashboard never stalls.
+* **Evb034 / 400-series (firmware ≥ 600) — basic:** device-list + dashboard only. Advanced/History/Regeneration are Evb019-only and are gated by `model in (None, "Evb019")` to avoid mis-parsing; Evb034 uses a different `CsBlePacket` UART structure.
+* **Twin systems** (`is_twin_valve` / `D`-prefixed firmware) are detected and use twin-aware salt-dose (199) and flag decoding.
+
 ## Current capabilities
 
 * Establishes a Home Assistant config entry via the UI (no YAML required).
-* Watches for Bluetooth advertisements that match the expected Chandler valve
-  signatures, including both the Bluetooth name prefixes and the Chandler
-  manufacturer data identifier.
-* Tracks multiple valves simultaneously by their Bluetooth address so each
-  device is registered individually in Home Assistant.
-* Creates binary sensor entities that indicate whether each recognised valve is
-  currently available.
-* Creates a dedicated Valve Error problem sensor from the official app's error
-  mapping, while retaining unknown nonzero raw codes so automations fail safe.
-* Extracts the firmware version reported in the advertisement metadata and
-  surfaces it as an entity attribute for troubleshooting and diagnostics.
-* Classifies the advertisement payload to determine whether the valve reports
-  as an Evb019 (firmware < 600) or Evb034 (firmware ≥ 600) and exposes the model
-  via device information and entity state attributes.
-* Polls authenticated EVB019 dashboard data for flow, capacity, cycle state,
-  cycle timing, battery, and other operational sensors.
-* Provides **Refresh Now** plus guarded **Regenerate Now** and
-  **Next Regeneration Step** buttons. The integration refreshes valve state
-  before sending the state-dependent command, so only the action valid for the
-  current cycle state is available.
-* Supports persistent dashboard polling every one to four seconds and saves both
-  the interval and enabled state per valve. EVB019 valves disconnect after
-  approximately five idle seconds, so longer intervals cannot keep a BLE
-  session open reliably.
-
-This repository currently focuses on the scaffolding required for discovery and
-entity creation. Additional device metadata, richer entities, diagnostics, and
-configuration options will follow as device details become available.
+* Watches for Bluetooth advertisements that match the expected Chandler valve signatures (name prefixes `CS_`/`Chandler` + manufacturer ID), tracks multiple valves by Bluetooth address.
+* Creates `binary_sensor` availability + `Valve Error` problem sensor (official Evb019 bit map, unknown non-zero raw codes kept so automations fail-safe).
+* Surfaces firmware/model/serial via device info + entity attributes (Evb019 `<600` vs Evb034 `≥600` from `firmware.py`).
+* **Dashboard (117, every 15 min + optional 1-4s persistent, separate BLE connection)** — authenticated poll, read-only: `Present Flow`, `Water Hardness` (metered softeners), `Time of Day`, `Battery` (non-Clack), `Soft Water Remaining`, `Days Until Regeneration/Backwash`, `Water Usage Today`, `Peak Flow Today`, `Regeneration/Backwash State` + `Remaining` (with `cycle_remaining_seconds`/`cycle_phase`).
+* **Advanced Settings (118, every 1h, separate 2-packet connection)** — Evb019 only, read-only: 8× `Regen Position 1..8` sensors (`DIAGNOSTIC`, `minutes` or `lb` for softener salt-dose pos 5, `not_adjustable` flag via high-bit, defaults snapshot as attribute). Never blocks dashboard.
+* **Status & History (119, every 6h, separate ~14-packet connection, 12s timeout)** — Evb019 only, read-only: `History Total Gallons`/`Resettable` (`total_increasing`/`total`), `History Regen Count`/`Resettable`, `History Water Usage Day` (62× `gal/day` `*10`, state=today, `attributes: water_usage_day[62]`), `History Water Usage Per Regen` (42× `gal`, `attributes: water_usage_regen[42]`), `History Peak Flow` (62× `GPM` `*0.1`, `attributes: peak_flow[62]`). HA long-term statistics on `total_increasing` gives `gal/day` over years; valve's 62-day buffer is available instantly.
+* **Controls (read-only except guarded regeneration):** `Refresh Now` (dashboard `117` only), `Regenerate Now` / `Next Regeneration Step` (Evb019 only, refreshes state before send so only valid action is available). Regen cycle timings are intentionally not writable.
+* **Diagnostics:** polling interval + persistent-connection toggle per valve (persisted per address, survives restarts), reset-buffer `114` sent on disconnect.
+* **Probe:** `tools/chandler_ble_probe.py` does read-only `116→117→118→119` captures (`--dashboard-seconds`/`--advanced-settings-seconds`/`--history-seconds`) for manual validation; `diagnostics/` is gitignored.
 
 ## Installation
 
