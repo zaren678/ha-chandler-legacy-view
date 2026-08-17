@@ -15,12 +15,12 @@ condition:
     state: "Idle"
   - condition: template
     value_template: >-
-      {% set refresh = states.button.mechanical_room_treatment_valve_treatment_valve_refresh_now %}
-      {{ refresh is defined and refresh.state != 'unavailable' }}
+      {{ states('button.mechanical_room_treatment_valve_treatment_valve_refresh_now')
+         not in ['unknown', 'unavailable'] }}
   - condition: template
     value_template: >-
-      {% set sync = states.button.mechanical_room_treatment_valve_treatment_valve_sync_time %}
-      {{ sync is defined and sync.state != 'unavailable' }}
+      {{ states('button.mechanical_room_treatment_valve_treatment_valve_sync_time')
+         not in ['unknown', 'unavailable'] }}
 action:
   - service: button.press
     continue_on_error: true
@@ -31,7 +31,7 @@ action:
       - condition: template
         value_template: >-
           {% set raw = states('sensor.treatment_valve_treatment_valve_time_of_day') %}
-          {% set last = states('sensor.treatment_valve_treatment_valve_last_successful_update') %}
+          {% set last = states('sensor.mechanical_room_treatment_valve_treatment_valve_last_successful_update') %}
           {% set parsed = strptime(raw, '%I:%M %p', none) %}
           {% if parsed is none %}
             false

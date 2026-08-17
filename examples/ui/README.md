@@ -8,7 +8,7 @@ Each file is a SINGLE dict ready for **Settings → Automations → Create Autom
    - `02_disable_persistent.yaml` — off 5m after Idle
    - `03_stuck_remediation.yaml` — valve_error 10s OR Decompress/Air Release 120s stall (10.4s/9.3s motors + 44.8s dropout) → Next Step → plug `switch.unnamed_p316m_tapo_p316m_2` off 30s/on
    - `04_fake_idle_notify.yaml` — notify-only 10m Idle+flow>0.08
-   - `05_bluetooth_watchdog.yaml` — Last Successful Update stale for 35m → plug off 30s/on, rediscover, refresh
+   - `05_bluetooth_watchdog.yaml` — Last Successful Update stale for 35m → try 3 refreshes → only then plug off 30s/on, rediscover, refresh
    - `06_sync_clock.yaml` — six-hour clock check; press Sync Time only when drift exceeds 5m
 
 The Sync Time and diagnostic entities are new. After installing/reloading the
