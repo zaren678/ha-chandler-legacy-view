@@ -509,6 +509,7 @@ class ValveDiscoveryManager:
         self._callbacks: list[CALLBACK_TYPE] = []
         self._listeners: list[ValveListener] = []
         self._devices: Dict[str, ValveAdvertisement] = {}
+        self._known_addresses: set[str] = set()
 
     async def async_setup(self) -> None:
         """Start listening for Bluetooth advertisements."""
@@ -533,6 +534,7 @@ class ValveDiscoveryManager:
             remove()
         self._listeners.clear()
         self._devices.clear()
+        self._known_addresses.clear()
 
     @property
     def devices(self) -> Dict[str, ValveAdvertisement]:
@@ -687,6 +689,15 @@ class ValveDiscoveryManager:
                 advertisement = _merge_incomplete_advertisement(
                     previous_advertisement, advertisement
                 )
+            if advertisement.address not in self._known_addresses:
+                _LOGGER.info(
+                    "Discovered Chandler valve address=%s name=%r model=%s firmware=%s",
+                    advertisement.address,
+                    advertisement.name,
+                    advertisement.model,
+                    format_firmware_version(advertisement) or "unknown",
+                )
+                self._known_addresses.add(advertisement.address)
             async_update_device_sw_version(
                 self._hass,
                 advertisement.address,

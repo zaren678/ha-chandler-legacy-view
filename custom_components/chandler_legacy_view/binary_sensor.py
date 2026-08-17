@@ -61,6 +61,7 @@ class ValvePresenceBinarySensor(ChandlerValveEntity, BinarySensorEntity):
         """Provide metadata about the most recent advertisement."""
 
         attributes: dict[str, int | str] = {}
+        attributes["bluetooth_address"] = self._advertisement.address
         is_clack_valve = _is_clack_valve(self._advertisement.name)
         can_report_low_salt = _can_report_low_salt(self._advertisement.name)
         if self._advertisement.rssi is not None:

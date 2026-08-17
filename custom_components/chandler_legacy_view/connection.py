@@ -26,6 +26,7 @@ from homeassistant.core import CALLBACK_TYPE, CoreState, HomeAssistant, callback
 from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.util import dt as dt_util
 
+from .clock import create_set_time_payload
 from .const import (
     CONF_DEFAULT_PASSCODE,
     CONF_DEVICE_PASSCODES,
@@ -268,6 +269,8 @@ class ValveConnection:
         self._history_lock = asyncio.Lock()
         self._history_cooldown_until: datetime | None = None
         self._authentication_listeners: list[Callable[[bool], None]] = []
+        self._last_clock_sync: datetime | None = None
+        self._clock_sync_listeners: list[Callable[[datetime], None]] = []
         self._passcode_getter = passcode_getter
         self._crc8 = _ChandlerCrc8()
         self._persistent_connection_enabled = bool(persistent_connection_enabled)
@@ -293,6 +296,12 @@ class ValveConnection:
         """Return the timestamp of the last successful poll."""
 
         return self._last_success
+
+    @property
+    def last_clock_sync(self) -> datetime | None:
+        """Return the timestamp of the last successful clock write."""
+
+        return self._last_clock_sync
 
     @property
     def serial_number(self) -> str | None:
@@ -469,6 +478,22 @@ class ValveConnection:
         def _remove_listener() -> None:
             with contextlib.suppress(ValueError):
                 self._dashboard_listeners.remove(listener)
+
+        return _remove_listener
+
+    def add_clock_sync_listener(
+        self, listener: Callable[[datetime], None]
+    ) -> CALLBACK_TYPE:
+        """Register a callback for successful valve clock writes."""
+
+        self._clock_sync_listeners.append(listener)
+
+        if self._last_clock_sync is not None:
+            self._hass.loop.call_soon(listener, self._last_clock_sync)
+
+        def _remove_listener() -> None:
+            with contextlib.suppress(ValueError):
+                self._clock_sync_listeners.remove(listener)
 
         return _remove_listener
 
@@ -998,6 +1023,110 @@ class ValveConnection:
                 self._next_connection_time = None
                 self.schedule_poll()
 
+    async def async_sync_time(self) -> None:
+        """Set the valve clock to Home Assistant's local time."""
+
+        if not self.available:
+            raise ValveCommandError("The valve is not currently available")
+
+        restart_persistent_session = self._persistent_connection_enabled
+        try:
+            async with self._lock:
+                if self._persistent_task_active():
+                    await self._async_stop_persistent_session()
+                await self._async_sync_time_locked()
+        finally:
+            if restart_persistent_session and not self._unloaded:
+                self._next_connection_time = None
+                self.schedule_poll()
+
+    async def _async_sync_time_locked(self) -> None:
+        """Send Set Time while the connection lock is held."""
+
+        advertisement = self._advertisement
+        if advertisement is None:
+            raise ValveCommandError("No Bluetooth advertisement is available")
+        if advertisement.model not in (None, "Evb019"):
+            raise ValveCommandError(
+                f"Clock synchronization is not supported for {advertisement.model}"
+            )
+
+        ble_device = bluetooth.async_ble_device_from_address(
+            self._hass, self._address, connectable=True
+        )
+        if ble_device is None:
+            raise ValveCommandError("The valve is not currently connectable")
+
+        client: BaseBleakClient | None = None
+        try:
+            try:
+                async with asyncio.timeout(CONNECTION_TIMEOUT_SECONDS):
+                    client = await establish_connection(
+                        BleakClientWithServiceCache,
+                        ble_device,
+                        self._address,
+                    )
+            except asyncio.TimeoutError as exc:
+                raise ValveCommandError(
+                    "Timed out while connecting to the valve"
+                ) from exc
+            except BLEAK_RETRY_EXCEPTIONS as exc:
+                raise ValveCommandError(
+                    f"Unable to connect to the valve: {exc}"
+                ) from exc
+            except Exception as exc:  # pragma: no cover - platform-specific BLE errors
+                raise ValveCommandError(
+                    f"Unexpected error while connecting to the valve: {exc}"
+                ) from exc
+
+            if not await self._async_fetch_device_information(client):
+                raise ValveCommandError(
+                    "Could not authenticate and refresh the valve state"
+                )
+
+            local_now = dt_util.now()
+            if not await self._async_send_payload(
+                client,
+                create_set_time_payload(local_now),
+                command_name="Sync Time",
+            ):
+                raise ValveCommandError("Failed to synchronize the valve clock")
+
+            self._last_clock_sync = dt_util.utcnow()
+            for listener in list(self._clock_sync_listeners):
+                try:
+                    listener(self._last_clock_sync)
+                except Exception:  # pragma: no cover - listener failures are logged
+                    _LOGGER.exception(
+                        "Unexpected error in clock sync listener for valve %s",
+                        self._address,
+                    )
+            _LOGGER.info(
+                "Synchronized valve %s clock to %s",
+                self._address,
+                local_now.isoformat(timespec="seconds"),
+            )
+
+            # Confirm the command by refreshing the dashboard. The write has
+            # already succeeded, so a refresh failure is only logged.
+            try:
+                await asyncio.sleep(0.25)
+                _, refreshed = await self._async_request_dashboard(client)
+                if refreshed:
+                    self._last_success = dt_util.utcnow()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover - best-effort refresh
+                _LOGGER.debug(
+                    "Unable to refresh valve %s after clock synchronization: %s",
+                    self._address,
+                    exc,
+                )
+        finally:
+            if client is not None:
+                await self._async_disconnect_client(client)
+            self._set_connection_cooldown()
+
     async def _async_regenerate_locked(
         self, *, advance_current_cycle: bool
     ) -> None:
@@ -1264,9 +1393,8 @@ class ValveConnection:
 
             if self._parse_passcode(passcode) is None:
                 _LOGGER.debug(
-                    "Skipping Dashboard request to valve %s; configured passcode %r is not numeric",
+                    "Skipping Dashboard request to valve %s; configured passcode is not numeric",
                     self._address,
-                    passcode,
                 )
                 return False
 
@@ -1654,9 +1782,8 @@ class ValveConnection:
             passcode_value = self._parse_passcode(passcode)
             if passcode is not None and passcode_value is None:
                 _LOGGER.debug(
-                    "Skipping authentication for valve %s; configured passcode %r is not numeric",
+                    "Skipping authentication for valve %s; configured passcode is not numeric",
                     self._address,
-                    passcode,
                 )
 
             if self._should_attempt_authentication(passcode, passcode_value):
@@ -3026,21 +3153,21 @@ class ValveConnection:
                         )
             except Exception:  # pylint: disable=broad-exception-caught
                 _LOGGER.debug(
-                    "Valve %s failed to decode firmware from DeviceList packet %s",
+                    "Valve %s failed to decode firmware from DeviceList packet of length %s",
                     self._address,
-                    packet.hex(),
+                    len(packet),
                 )
 
         decoded_password = self._decode_device_list_password(packet)
         self._device_list_decoded_password = decoded_password
         if decoded_password is not None:
             _LOGGER.debug(
-                "Valve %s DeviceList passcode decode -> state=%s auth=%s requires_auth=%s passcode=%s",
+                "Valve %s DeviceList passcode decode -> state=%s auth=%s requires_auth=%s passcode_present=%s",
                 self._address,
                 decoded_password.state.name,
                 decoded_password.authentication_state.name,
                 decoded_password.authentication_required,
-                decoded_password.passcode if decoded_password.passcode else "<empty>",
+                bool(decoded_password.passcode),
             )
             if (
                 decoded_password.authentication_state
@@ -3067,7 +3194,7 @@ class ValveConnection:
             return
 
         if serial_number != self._serial_number:
-            _LOGGER.debug(
+            _LOGGER.info(
                 "Valve %s reported serial number %s", self._address, serial_number
             )
         self._serial_number = serial_number

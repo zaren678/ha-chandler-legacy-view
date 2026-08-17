@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from datetime import datetime
 
 from homeassistant.components.bluetooth import BluetoothChange
 from homeassistant.components.sensor import (
@@ -25,6 +26,7 @@ WATER_HARDNESS_GRAINS_PER_GALLON = "grains_per_gallon"
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
 
 from .const import DATA_CONNECTION_MANAGER, DATA_DISCOVERY_MANAGER, DOMAIN
 from .connection import ValveConnection, ValveConnectionManager
@@ -206,6 +208,89 @@ class ValveTimeOfDaySensor(ValveDashboardSensor):
         return format_time_of_day(
             dashboard.time_hour, dashboard.time_minute, dashboard.is_pm
         )
+
+
+class ValveDiagnosticTimestampSensor(ValveDashboardSensor):
+    """Keep the last diagnostic timestamp visible while Bluetooth is down."""
+
+    @callback
+    def async_handle_bluetooth_update(
+        self, advertisement: ValveAdvertisement, change: BluetoothChange
+    ) -> None:
+        """Preserve the timestamp when the valve becomes unavailable."""
+
+        if change not in BLUETOOTH_LOST_CHANGES:
+            self.async_update_from_advertisement(advertisement)
+        self._attr_available = True
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+
+class ValveLastSuccessfulUpdateSensor(ValveDiagnosticTimestampSensor):
+    """Report when the valve last returned a valid Dashboard response."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(
+        self, advertisement: ValveAdvertisement, connection: ValveConnection
+    ) -> None:
+        super().__init__(
+            advertisement,
+            connection,
+            unique_id_suffix="last_successful_update",
+            name_suffix="Last Successful Update",
+        )
+
+    def _extract_native_value(
+        self, dashboard: ValveDashboardData | None
+    ) -> datetime | None:
+        if dashboard is None:
+            return None
+        return dt_util.utcnow()
+
+
+class ValveLastClockSyncSensor(ValveDiagnosticTimestampSensor):
+    """Report when Home Assistant last synchronized the valve clock."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(
+        self, advertisement: ValveAdvertisement, connection: ValveConnection
+    ) -> None:
+        self._connection = connection
+        self._remove_clock_sync_listener: CALLBACK_TYPE | None = None
+        super().__init__(
+            advertisement,
+            connection,
+            unique_id_suffix="last_clock_sync",
+            name_suffix="Last Clock Sync",
+        )
+        self._remove_clock_sync_listener = connection.add_clock_sync_listener(
+            self._handle_clock_sync
+        )
+
+    def _extract_native_value(
+        self, dashboard: ValveDashboardData | None
+    ) -> datetime | None:
+        return self._connection.last_clock_sync
+
+    @callback
+    def _handle_clock_sync(self, value: datetime) -> None:
+        """Update the diagnostic timestamp after a successful clock write."""
+
+        self._attr_native_value = value
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Clean up clock and dashboard listeners."""
+
+        await super().async_will_remove_from_hass()
+        if self._remove_clock_sync_listener is not None:
+            self._remove_clock_sync_listener()
+            self._remove_clock_sync_listener = None
 
 
 class ValveRegenerationTimeSensor(ValveDashboardSensor):
@@ -841,6 +926,8 @@ async def async_setup_entry(
     flow_entities: dict[str, ValvePresentFlowSensor] = {}
     hardness_entities: dict[str, ValveWaterHardnessSensor] = {}
     time_entities: dict[str, ValveTimeOfDaySensor] = {}
+    last_update_entities: dict[str, ValveLastSuccessfulUpdateSensor] = {}
+    last_clock_sync_entities: dict[str, ValveLastClockSyncSensor] = {}
     regeneration_time_entities: dict[str, ValveRegenerationTimeSensor] = {}
     battery_entities: dict[str, ValveBatteryCapacitySensor] = {}
     soft_water_entities: dict[str, ValveSoftWaterRemainingSensor] = {}
@@ -917,6 +1004,27 @@ async def async_setup_entry(
             time_entities,
             factory=lambda adv, conn: ValveTimeOfDaySensor(adv, conn),
             debug_description="time of day",
+        )
+
+    def _ensure_last_update_entity(
+        advertisement: ValveAdvertisement,
+    ) -> tuple[ValveDashboardSensor | None, list[ValveDashboardSensor]]:
+        return _ensure_dashboard_entity(
+            advertisement,
+            last_update_entities,
+            factory=lambda adv, conn: ValveLastSuccessfulUpdateSensor(adv, conn),
+            debug_description="last successful update",
+        )
+
+    def _ensure_last_clock_sync_entity(
+        advertisement: ValveAdvertisement,
+    ) -> tuple[ValveDashboardSensor | None, list[ValveDashboardSensor]]:
+        return _ensure_dashboard_entity(
+            advertisement,
+            last_clock_sync_entities,
+            predicate=lambda adv: adv.model in (None, "Evb019"),
+            factory=lambda adv, conn: ValveLastClockSyncSensor(adv, conn),
+            debug_description="last clock sync",
         )
 
     def _ensure_regeneration_time_entity(
@@ -1075,6 +1183,8 @@ async def async_setup_entry(
         _ensure_flow_entity,
         _ensure_hardness_entity,
         _ensure_time_entity,
+        _ensure_last_update_entity,
+        _ensure_last_clock_sync_entity,
         _ensure_regeneration_time_entity,
         _ensure_battery_entity,
         _ensure_soft_water_entity,
@@ -1117,6 +1227,8 @@ async def async_setup_entry(
         flow_entities,
         hardness_entities,
         time_entities,
+        last_update_entities,
+        last_clock_sync_entities,
         regeneration_time_entities,
         battery_entities,
         soft_water_entities,
