@@ -32,6 +32,7 @@ from .const import (
     CONF_DEVICE_PASSCODES,
     CONF_DEVICE_PERSISTENT_CONNECTIONS,
     CONF_DEVICE_POLL_INTERVALS,
+    CONF_WATCHDOG_TIMEOUT_MINUTES,
     CONNECTION_MIN_RETRY_INTERVAL,
     CONNECTION_POLL_INTERVAL,
     CONNECTION_TIMEOUT_SECONDS,
@@ -44,6 +45,16 @@ from .device_registry import (
 from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
 from .entity import format_firmware_version
 from .firmware import decode_firmware_version, firmware_model
+from .maintenance import (
+    CLOCK_CHECK_INTERVAL,
+    CLOCK_DRIFT_LIMIT_MINUTES,
+    RECOVERY_REFRESH_ATTEMPTS,
+    WATCHDOG_CHECK_INTERVAL,
+    clock_drift_minutes,
+    dashboard_is_stale,
+    run_refresh_attempts,
+    watchdog_timeout_duration,
+)
 from .models import (
     ValveAdvancedSettingsData,
     ValveAdvertisement,
@@ -233,6 +244,7 @@ class ValveConnection:
         passcode_getter: Callable[[str], ValvePasscodeConfiguration] | None = None,
         persistent_poll_interval: object = None,
         persistent_connection_enabled: bool = False,
+        watchdog_timeout_getter: Callable[[], timedelta] | None = None,
     ) -> None:
         """Initialize the valve connection handler."""
 
@@ -242,6 +254,11 @@ class ValveConnection:
         self._available = False
         self._last_seen: datetime | None = None
         self._last_success: datetime | None = None
+        self._monitoring_started = dt_util.utcnow()
+        self._recovery_required = False
+        self._recovery_listeners: list[Callable[[bool], None]] = []
+        self._recovery_task: asyncio.Task[None] | None = None
+        self._clock_check_task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
         self._unloaded = False
         self._next_connection_time: datetime | None = None
@@ -272,6 +289,7 @@ class ValveConnection:
         self._last_clock_sync: datetime | None = None
         self._clock_sync_listeners: list[Callable[[datetime], None]] = []
         self._passcode_getter = passcode_getter
+        self._watchdog_timeout_getter = watchdog_timeout_getter
         self._crc8 = _ChandlerCrc8()
         self._persistent_connection_enabled = bool(persistent_connection_enabled)
         self._persistent_poll_interval = normalize_persistent_poll_interval(
@@ -296,6 +314,20 @@ class ValveConnection:
         """Return the timestamp of the last successful poll."""
 
         return self._last_success
+
+    @property
+    def recovery_required(self) -> bool:
+        """Return whether non-destructive dashboard recovery has failed."""
+
+        return self._recovery_required
+
+    @property
+    def watchdog_timeout(self) -> timedelta:
+        """Return the configured dashboard-staleness timeout."""
+
+        if self._watchdog_timeout_getter is None:
+            return watchdog_timeout_duration(None)
+        return self._watchdog_timeout_getter()
 
     @property
     def last_clock_sync(self) -> datetime | None:
@@ -497,6 +529,18 @@ class ValveConnection:
 
         return _remove_listener
 
+    def add_recovery_listener(self, listener: Callable[[bool], None]) -> CALLBACK_TYPE:
+        """Register a callback for watchdog recovery state changes."""
+
+        self._recovery_listeners.append(listener)
+        self._hass.loop.call_soon(listener, self._recovery_required)
+
+        def _remove_listener() -> None:
+            with contextlib.suppress(ValueError):
+                self._recovery_listeners.remove(listener)
+
+        return _remove_listener
+
     def add_advanced_settings_listener(
         self, listener: Callable[[ValveAdvancedSettingsData | None], None]
     ) -> CALLBACK_TYPE:
@@ -540,6 +584,216 @@ class ValveConnection:
         """Mark the valve as temporarily unavailable."""
 
         self._available = False
+
+    def _set_recovery_required(self, required: bool) -> None:
+        """Update and publish the watchdog recovery state."""
+
+        if self._recovery_required == required:
+            return
+
+        self._recovery_required = required
+        for listener in list(self._recovery_listeners):
+            try:
+                listener(required)
+            except Exception:  # pragma: no cover - listener failures are logged
+                _LOGGER.exception(
+                    "Unexpected error in recovery listener for valve %s",
+                    self._address,
+                )
+
+    def _record_dashboard_success(self) -> None:
+        """Record a valid Dashboard response and clear recovery state."""
+
+        self._last_success = dt_util.utcnow()
+        if self._recovery_required:
+            _LOGGER.info(
+                "Valve %s Dashboard communication recovered",
+                self._address,
+            )
+        self._set_recovery_required(False)
+
+    def _dashboard_cycle_is_active(self) -> bool:
+        """Return whether the last Dashboard response reports an active cycle."""
+
+        dashboard = self._dashboard_data
+        return dashboard is not None and regeneration_is_active(
+            dashboard.regen_active,
+            dashboard.prefill_soak_mode,
+        )
+
+    @callback
+    def _handle_recovery_task_done(self, task: asyncio.Task[None]) -> None:
+        """Collect completion or failure from a watchdog task."""
+
+        if self._recovery_task is task:
+            self._recovery_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:  # pragma: no cover - unexpected task failures are logged
+            _LOGGER.exception(
+                "Unexpected error in recovery watchdog for valve %s",
+                self._address,
+            )
+
+    @callback
+    def _handle_clock_check_task_done(self, task: asyncio.Task[None]) -> None:
+        """Collect completion or failure from a clock-maintenance task."""
+
+        if self._clock_check_task is task:
+            self._clock_check_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:  # pragma: no cover - unexpected task failures are logged
+            _LOGGER.exception(
+                "Unexpected error in clock maintenance for valve %s",
+                self._address,
+            )
+
+    def schedule_recovery_check(self) -> None:
+        """Schedule one watchdog evaluation unless one is already running."""
+
+        if self._unloaded or self._hass.state != CoreState.running:
+            return
+        if self._recovery_task is not None and not self._recovery_task.done():
+            return
+
+        self._recovery_task = self._hass.async_create_task(self.async_check_recovery())
+        self._recovery_task.add_done_callback(self._handle_recovery_task_done)
+
+    def schedule_clock_check(self) -> None:
+        """Schedule one valve clock evaluation unless one is already running."""
+
+        if self._unloaded or self._hass.state != CoreState.running:
+            return
+        if self._clock_check_task is not None and not self._clock_check_task.done():
+            return
+
+        self._clock_check_task = self._hass.async_create_task(self.async_check_clock())
+        self._clock_check_task.add_done_callback(self._handle_clock_check_task_done)
+
+    async def async_check_recovery(self) -> None:
+        """Try non-destructive refreshes before requesting external recovery."""
+
+        if self._unloaded or self._recovery_required:
+            return
+
+        now = dt_util.utcnow()
+        if not dashboard_is_stale(
+            self._last_success,
+            self._monitoring_started,
+            now,
+            self.watchdog_timeout,
+        ):
+            return
+
+        if self.available and self._dashboard_cycle_is_active():
+            _LOGGER.warning(
+                "Valve %s Dashboard data is stale, but recovery is deferred "
+                "because the last known cycle is active",
+                self._address,
+            )
+            return
+
+        async def _attempt_refresh(attempt: int) -> bool:
+            if self._unloaded:
+                return False
+
+            _LOGGER.warning(
+                "Valve %s Dashboard data is stale; refresh attempt %s of %s",
+                self._address,
+                attempt,
+                RECOVERY_REFRESH_ATTEMPTS,
+            )
+            try:
+                await self.async_refresh_now()
+            except ValveCommandError as exc:
+                _LOGGER.warning(
+                    "Valve %s watchdog refresh attempt %s failed: %s",
+                    self._address,
+                    attempt,
+                    exc,
+                )
+
+            return not dashboard_is_stale(
+                self._last_success,
+                self._monitoring_started,
+                dt_util.utcnow(),
+                self.watchdog_timeout,
+            )
+
+        successful_attempt = await run_refresh_attempts(_attempt_refresh)
+        if self._unloaded:
+            return
+        if successful_attempt is not None:
+            _LOGGER.info(
+                "Valve %s watchdog refresh succeeded on attempt %s",
+                self._address,
+                successful_attempt,
+            )
+            return
+
+        _LOGGER.error(
+            "Valve %s did not respond to %s refresh attempts; external "
+            "recovery is required after %s minutes without Dashboard data",
+            self._address,
+            RECOVERY_REFRESH_ATTEMPTS,
+            int(self.watchdog_timeout.total_seconds() // 60),
+        )
+        self._set_recovery_required(True)
+
+    async def async_check_clock(self) -> None:
+        """Refresh and synchronize the valve clock when drift exceeds the limit."""
+
+        if (
+            self._unloaded
+            or self._recovery_required
+            or not self.available
+            or self._dashboard_cycle_is_active()
+        ):
+            return
+
+        try:
+            await self.async_refresh_now()
+        except ValveCommandError as exc:
+            _LOGGER.debug(
+                "Unable to refresh valve %s for clock maintenance: %s",
+                self._address,
+                exc,
+            )
+            return
+
+        dashboard = self._dashboard_data
+        if dashboard is None or self._dashboard_cycle_is_active():
+            return
+
+        local_now = dt_util.now()
+        drift = clock_drift_minutes(
+            dashboard.time_hour,
+            dashboard.time_minute,
+            dashboard.is_pm,
+            local_now,
+        )
+        if drift is None or drift <= CLOCK_DRIFT_LIMIT_MINUTES:
+            return
+
+        _LOGGER.info(
+            "Valve %s clock differs from Home Assistant by %s minutes; "
+            "synchronizing",
+            self._address,
+            drift,
+        )
+        try:
+            await self.async_sync_time()
+        except ValveCommandError as exc:
+            _LOGGER.warning(
+                "Unable to synchronize valve %s clock: %s",
+                self._address,
+                exc,
+            )
 
     def schedule_poll(self) -> None:
         """Schedule a background poll of the valve (dashboard only, lightweight)."""
@@ -722,9 +976,7 @@ class ValveConnection:
                     )
                     break
 
-                if response_received:
-                    self._last_success = dt_util.utcnow()
-                else:
+                if not response_received:
                     _LOGGER.debug(
                         "Valve %s did not provide a Dashboard response during persistent polling",
                         self._address,
@@ -760,6 +1012,19 @@ class ValveConnection:
         self._unloaded = True
         self._persistent_connection_enabled = False
         self._cancel_cooldown()
+
+        maintenance_tasks = tuple(
+            task
+            for task in (self._recovery_task, self._clock_check_task)
+            if task is not None and not task.done()
+        )
+        for task in maintenance_tasks:
+            task.cancel()
+        if maintenance_tasks:
+            await asyncio.gather(*maintenance_tasks, return_exceptions=True)
+        self._recovery_task = None
+        self._clock_check_task = None
+
         await self._async_stop_persistent_session()
         async with self._lock:
             return
@@ -927,7 +1192,6 @@ class ValveConnection:
                 return False
             sent, received = await self._async_request_advanced_settings(client)
             if received:
-                self._last_success = dt_util.utcnow()
                 self._history_last_success = dt_util.utcnow()
                 _LOGGER.debug("Retrieved Advanced Settings from valve %s (separate poll)", self._address)
             return received
@@ -1111,9 +1375,7 @@ class ValveConnection:
             # already succeeded, so a refresh failure is only logged.
             try:
                 await asyncio.sleep(0.25)
-                _, refreshed = await self._async_request_dashboard(client)
-                if refreshed:
-                    self._last_success = dt_util.utcnow()
+                await self._async_request_dashboard(client)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover - best-effort refresh
@@ -1206,9 +1468,7 @@ class ValveConnection:
             # this into a false negative that encourages a duplicate command.
             try:
                 await asyncio.sleep(0.25)
-                _, refreshed = await self._async_request_dashboard(client)
-                if refreshed:
-                    self._last_success = dt_util.utcnow()
+                await self._async_request_dashboard(client)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover - best-effort refresh
@@ -1302,10 +1562,10 @@ class ValveConnection:
                     "Error while retrieving extended data from valve %s", self._address
                 )
             else:
-                if dashboard_response_received:
-                    self._last_success = dt_util.utcnow()
-                    if self._try_begin_persistent_session(client):
-                        cleanup_client = None
+                if dashboard_response_received and self._try_begin_persistent_session(
+                    client
+                ):
+                    cleanup_client = None
             finally:
                 if cleanup_client is not None:
                     await self._async_disconnect_client(cleanup_client)
@@ -2127,6 +2387,7 @@ class ValveConnection:
                 return True, False
 
             self._handle_dashboard_packets(packets_list)
+            self._record_dashboard_success()
             return True, True
         finally:
             await self._async_unsubscribe_notifications(client, subscriptions)
@@ -3380,6 +3641,8 @@ class ValveConnectionManager:
         self._cancel_interval: CALLBACK_TYPE | None = None
         self._cancel_advanced_interval: CALLBACK_TYPE | None = None
         self._cancel_history_interval: CALLBACK_TYPE | None = None
+        self._cancel_recovery_interval: CALLBACK_TYPE | None = None
+        self._cancel_clock_interval: CALLBACK_TYPE | None = None
         self._startup_unsub: CALLBACK_TYPE | None = None
 
     async def async_setup(self) -> None:
@@ -3406,6 +3669,16 @@ class ValveConnectionManager:
         self._cancel_history_interval = async_track_time_interval(
             self._hass, self._handle_history_poll_interval, _HISTORY_POLL_INTERVAL
         )
+        self._cancel_recovery_interval = async_track_time_interval(
+            self._hass,
+            self._handle_recovery_interval,
+            WATCHDOG_CHECK_INTERVAL,
+        )
+        self._cancel_clock_interval = async_track_time_interval(
+            self._hass,
+            self._handle_clock_interval,
+            CLOCK_CHECK_INTERVAL,
+        )
 
         if self._hass.state != CoreState.running:
             self._startup_unsub = self._hass.bus.async_listen_once(
@@ -3430,6 +3703,14 @@ class ValveConnectionManager:
         if self._cancel_history_interval is not None:
             self._cancel_history_interval()
             self._cancel_history_interval = None
+
+        if self._cancel_recovery_interval is not None:
+            self._cancel_recovery_interval()
+            self._cancel_recovery_interval = None
+
+        if self._cancel_clock_interval is not None:
+            self._cancel_clock_interval()
+            self._cancel_clock_interval = None
 
         if self._startup_unsub is not None:
             self._startup_unsub()
@@ -3466,6 +3747,20 @@ class ValveConnectionManager:
 
         for connection in self._connections.values():
             connection.schedule_history_poll()
+
+    @callback
+    def _handle_recovery_interval(self, _: datetime) -> None:
+        """Evaluate Dashboard health and attempt non-destructive recovery."""
+
+        for connection in self._connections.values():
+            connection.schedule_recovery_check()
+
+    @callback
+    def _handle_clock_interval(self, _: datetime) -> None:
+        """Refresh and correct each known valve clock when necessary."""
+
+        for connection in self._connections.values():
+            connection.schedule_clock_check()
 
     async def _handle_home_assistant_started(self, _: object) -> None:
         """Trigger an initial poll once Home Assistant startup completes."""
@@ -3507,6 +3802,7 @@ class ValveConnectionManager:
                 self.get_passcode,
                 self.get_persistent_poll_interval(advertisement.address),
                 self.get_persistent_connection_enabled(advertisement.address),
+                self.get_watchdog_timeout,
             )
             self._connections[advertisement.address] = connection
         connection.update_from_advertisement(advertisement)
@@ -3516,6 +3812,13 @@ class ValveConnectionManager:
         """Return an iterable over the tracked valve connections."""
 
         return self._connections.values()
+
+    def get_watchdog_timeout(self) -> timedelta:
+        """Return the configured dashboard watchdog timeout."""
+
+        return watchdog_timeout_duration(
+            self._config_entry.options.get(CONF_WATCHDOG_TIMEOUT_MINUTES)
+        )
 
     def get_connection(self, address: str) -> ValveConnection | None:
         """Return the connection for a specific valve address, if available."""

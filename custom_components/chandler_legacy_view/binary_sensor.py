@@ -11,9 +11,11 @@ from homeassistant.components.binary_sensor import (
 from homeassistant.components.bluetooth import BluetoothChange
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DATA_DISCOVERY_MANAGER, DOMAIN
+from .connection import ValveConnection, ValveConnectionManager
+from .const import DATA_CONNECTION_MANAGER, DATA_DISCOVERY_MANAGER, DOMAIN
 from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
 from .entity import (
     ChandlerValveEntity,
@@ -27,6 +29,7 @@ from .entity import (
     _water_status_display,
     format_firmware_version,
 )
+from .maintenance import RECOVERY_REFRESH_ATTEMPTS
 from .models import ValveAdvertisement
 from .valve_error import valve_error_active, valve_error_display
 
@@ -238,6 +241,71 @@ class ValveErrorBinarySensor(ChandlerValveEntity, BinarySensorEntity):
         return attributes
 
 
+class ValveRecoveryRequiredBinarySensor(ChandlerValveEntity, BinarySensorEntity):
+    """Report when dashboard refresh retries require external recovery."""
+
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_available = True
+
+    def __init__(
+        self,
+        advertisement: ValveAdvertisement,
+        connection: ValveConnection,
+    ) -> None:
+        super().__init__(advertisement)
+        self._connection = connection
+        self._attr_unique_id = f"{advertisement.address}_recovery_required"
+        self._attr_name = f"{self._attr_name} Recovery Required"
+        self._attr_is_on = connection.recovery_required
+        self._remove_recovery_listener = connection.add_recovery_listener(
+            self._handle_recovery_update
+        )
+
+    @callback
+    def _handle_recovery_update(self, required: bool) -> None:
+        """Publish watchdog recovery state changes."""
+
+        self._attr_is_on = required
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+    @callback
+    def async_handle_bluetooth_update(
+        self, advertisement: ValveAdvertisement, change: BluetoothChange
+    ) -> None:
+        """Keep the diagnostic state visible while Bluetooth is unavailable."""
+
+        if change not in BLUETOOTH_LOST_CHANGES:
+            super().async_update_from_advertisement(advertisement)
+            self._attr_name = f"{self._attr_name} Recovery Required"
+        self._attr_available = True
+        self._attr_is_on = self._connection.recovery_required
+        self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> Mapping[str, int | str]:
+        """Expose watchdog timing and the latest successful Dashboard response."""
+
+        attributes: dict[str, int | str] = {
+            "refresh_attempts": RECOVERY_REFRESH_ATTEMPTS,
+            "stale_after_minutes": int(
+                self._connection.watchdog_timeout.total_seconds() // 60
+            ),
+        }
+        if self._connection.last_success is not None:
+            attributes["last_successful_update"] = (
+                self._connection.last_success.isoformat()
+            )
+        return attributes
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Remove the recovery listener when the entity is unloaded."""
+
+        await super().async_will_remove_from_hass()
+        self._remove_recovery_listener()
+
+
 class ValveSaltBinarySensor(ChandlerValveEntity, BinarySensorEntity):
     """Represent the salt status reported by a water system valve."""
 
@@ -301,6 +369,7 @@ async def async_setup_entry(
 
     entry_data = hass.data[DOMAIN][entry.entry_id]
     manager: ValveDiscoveryManager = entry_data[DATA_DISCOVERY_MANAGER]
+    connection_manager: ValveConnectionManager = entry_data[DATA_CONNECTION_MANAGER]
     entities: dict[str, dict[str, ChandlerValveEntity]] = {}
 
     def _ensure_entities_for_advertisement(
@@ -332,6 +401,16 @@ async def async_setup_entry(
         _get_or_create(
             "valve_error", lambda: ValveErrorBinarySensor(advertisement)
         )
+
+        connection = connection_manager.get_connection(advertisement.address)
+        if connection is not None:
+            _get_or_create(
+                "recovery_required",
+                lambda: ValveRecoveryRequiredBinarySensor(
+                    advertisement,
+                    connection,
+                ),
+            )
 
         if _can_report_low_salt(advertisement.name):
             _get_or_create("salt", lambda: ValveSaltBinarySensor(advertisement))

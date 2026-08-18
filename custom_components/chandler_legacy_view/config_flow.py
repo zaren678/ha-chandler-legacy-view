@@ -12,6 +12,9 @@ from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.selector import (
     BooleanSelector,
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
@@ -26,11 +29,18 @@ from .const import (
     CONF_DEVICE_PASSCODE,
     CONF_DEVICE_PASSCODES,
     CONF_REMOVE_OVERRIDE,
+    CONF_WATCHDOG_TIMEOUT_MINUTES,
     DATA_DISCOVERY_MANAGER,
     DEFAULT_VALVE_PASSCODE,
     DOMAIN,
 )
 from .entity import friendly_name_from_advertised_name
+from .maintenance import (
+    DEFAULT_WATCHDOG_TIMEOUT_MINUTES,
+    MAX_WATCHDOG_TIMEOUT_MINUTES,
+    MIN_WATCHDOG_TIMEOUT_MINUTES,
+    normalize_watchdog_timeout_minutes,
+)
 
 
 PASSCODE_PATTERN = re.compile(r"^\d{4}$")
@@ -140,6 +150,11 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
 
         if user_input is not None:
             updated_options = dict(self._config_entry.options)
+            updated_options[CONF_WATCHDOG_TIMEOUT_MINUTES] = (
+                normalize_watchdog_timeout_minutes(
+                    user_input.get(CONF_WATCHDOG_TIMEOUT_MINUTES)
+                )
+            )
 
             default_passcode_input = _coerce_passcode(
                 user_input.get(CONF_DEFAULT_PASSCODE)
@@ -205,6 +220,23 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
                     CONF_DEFAULT_PASSCODE, DEFAULT_VALVE_PASSCODE
                 ),
             ): PASSCODE_SELECTOR,
+            vol.Optional(
+                CONF_WATCHDOG_TIMEOUT_MINUTES,
+                default=normalize_watchdog_timeout_minutes(
+                    self._config_entry.options.get(
+                        CONF_WATCHDOG_TIMEOUT_MINUTES,
+                        DEFAULT_WATCHDOG_TIMEOUT_MINUTES,
+                    )
+                ),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=MIN_WATCHDOG_TIMEOUT_MINUTES,
+                    max=MAX_WATCHDOG_TIMEOUT_MINUTES,
+                    step=5,
+                    mode=NumberSelectorMode.BOX,
+                    unit_of_measurement="minutes",
+                )
+            ),
         }
 
         if device_options:

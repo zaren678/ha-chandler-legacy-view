@@ -1,29 +1,20 @@
-alias: "Treatment Valve — Bluetooth watchdog"
+alias: "Treatment Valve — Bluetooth recovery"
 description: >-
-  Power-cycle the filter after Last Successful Update is more than 35 minutes
-  old and three dashboard refresh attempts fail. Wait for rediscovery, request
-  one final refresh, then enforce a retry cooldown.
+  Power-cycle the filter when the integration's Recovery Required diagnostic
+  turns on after three failed dashboard refresh attempts.
 id: treatment_valve_bluetooth_watchdog
 mode: single
 max_exceeded: silent
 trigger:
+  - platform: state
+    entity_id: binary_sensor.mechanical_room_treatment_valve_treatment_valve_recovery_required
+    to: "on"
   - platform: time_pattern
     minutes: "/5"
 condition:
-  - condition: template
-    value_template: >-
-      {% set update = states['sensor.mechanical_room_treatment_valve_treatment_valve_last_successful_update'] %}
-      {% if update is none %}
-        false
-      {% elif update.state in ['unknown', 'unavailable'] %}
-        {{ (as_timestamp(now()) - as_timestamp(update.last_changed)) > 2100 }}
-      {% else %}
-        {{ (as_timestamp(now()) - as_timestamp(update.state, 0)) > 2100 }}
-      {% endif %}
-  - condition: template
-    value_template: >-
-      {{ states('sensor.mechanical_room_treatment_valve_treatment_valve_backwash_state')
-         in ['Idle', 'unknown', 'unavailable'] }}
+  - condition: state
+    entity_id: binary_sensor.mechanical_room_treatment_valve_treatment_valve_recovery_required
+    state: "on"
   - condition: state
     entity_id: switch.unnamed_p316m_tapo_p316m_2
     state: "on"
@@ -33,47 +24,8 @@ action:
       level: warning
       logger: custom_components.chandler_legacy_view.automation
       message: >-
-        Treatment Valve dashboard data is stale; attempting up to three
-        dashboard refreshes before power-cycling the filter.
-        Last successful update={{ states('sensor.mechanical_room_treatment_valve_treatment_valve_last_successful_update') }}
-  - repeat:
-      count: 3
-      sequence:
-        - if:
-            - condition: template
-              value_template: >-
-                {{ states('button.mechanical_room_treatment_valve_treatment_valve_refresh_now')
-                   not in ['unknown', 'unavailable'] }}
-          then:
-            - service: button.press
-              continue_on_error: true
-              target:
-                entity_id: button.mechanical_room_treatment_valve_treatment_valve_refresh_now
-        - delay: "00:00:30"
-        - if:
-            - condition: template
-              value_template: >-
-                {% set update = states('sensor.mechanical_room_treatment_valve_treatment_valve_last_successful_update') %}
-                {{ update not in ['unknown', 'unavailable']
-                   and (as_timestamp(now()) - as_timestamp(update, 0)) <= 2100 }}
-          then:
-            - service: system_log.write
-              data:
-                level: info
-                logger: custom_components.chandler_legacy_view.automation
-                message: >-
-                  Treatment Valve watchdog refresh succeeded on attempt
-                  {{ repeat.index }}; power cycle was not required.
-                  Last successful update={{ states('sensor.mechanical_room_treatment_valve_treatment_valve_last_successful_update') }}
-            - stop: "Dashboard refresh succeeded; power cycle not required"
-  - service: system_log.write
-    data:
-      level: warning
-      logger: custom_components.chandler_legacy_view.automation
-      message: >-
-        Treatment Valve did not respond to three dashboard refresh attempts;
-        power-cycling the filter.
-        Last successful update={{ states('sensor.mechanical_room_treatment_valve_treatment_valve_last_successful_update') }}
+        Treatment Valve requires external recovery after three failed
+        dashboard refreshes; power-cycling the filter.
   - service: switch.turn_off
     continue_on_error: true
     target:
@@ -96,9 +48,9 @@ action:
     then:
       - service: persistent_notification.create
         data:
-          title: "Treatment Valve watchdog: plug did not turn on"
+          title: "Treatment Valve recovery: plug did not turn on"
           message: >-
-            The watchdog tried three times to restore power to
+            The recovery automation tried three times to restore power to
             switch.unnamed_p316m_tapo_p316m_2. Check the smart plug immediately.
   - delay: "00:03:00"
   - if:
@@ -117,6 +69,6 @@ action:
       level: info
       logger: custom_components.chandler_legacy_view.automation
       message: >-
-        Treatment Valve watchdog recovery attempt completed.
-        Last successful update={{ states('sensor.mechanical_room_treatment_valve_treatment_valve_last_successful_update') }}
+        Treatment Valve recovery attempt completed. Recovery Required={{
+        states('binary_sensor.mechanical_room_treatment_valve_treatment_valve_recovery_required') }}
   - delay: "00:30:00"
