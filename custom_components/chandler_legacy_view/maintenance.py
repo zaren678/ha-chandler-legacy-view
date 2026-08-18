@@ -13,7 +13,9 @@ MAX_WATCHDOG_TIMEOUT_MINUTES = 1440
 RECOVERY_REFRESH_ATTEMPTS = 3
 RECOVERY_REFRESH_RETRY_DELAY_SECONDS = 30
 
-CLOCK_CHECK_INTERVAL = timedelta(hours=6)
+DEFAULT_CLOCK_SYNC_INTERVAL_HOURS = 6
+MIN_CLOCK_SYNC_INTERVAL_HOURS = 1
+MAX_CLOCK_SYNC_INTERVAL_HOURS = 168
 CLOCK_DRIFT_LIMIT_MINUTES = 5
 
 
@@ -34,6 +36,25 @@ def watchdog_timeout_duration(value: object) -> timedelta:
     """Return the normalized watchdog timeout as a duration."""
 
     return timedelta(minutes=normalize_watchdog_timeout_minutes(value))
+
+
+def normalize_clock_sync_interval_hours(value: object) -> int:
+    """Return a supported clock-maintenance interval in whole hours."""
+
+    try:
+        interval = int(value)
+    except (TypeError, ValueError):
+        interval = DEFAULT_CLOCK_SYNC_INTERVAL_HOURS
+    return max(
+        MIN_CLOCK_SYNC_INTERVAL_HOURS,
+        min(interval, MAX_CLOCK_SYNC_INTERVAL_HOURS),
+    )
+
+
+def clock_sync_interval_duration(value: object) -> timedelta:
+    """Return the normalized clock-maintenance interval as a duration."""
+
+    return timedelta(hours=normalize_clock_sync_interval_hours(value))
 
 
 async def run_refresh_attempts(

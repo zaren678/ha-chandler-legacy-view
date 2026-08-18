@@ -119,6 +119,24 @@ class MaintenanceTests(unittest.TestCase):
             _MAINTENANCE.watchdog_timeout_duration("45"),
         )
 
+    def test_normalizes_clock_sync_interval(self) -> None:
+        self.assertEqual(
+            6,
+            _MAINTENANCE.normalize_clock_sync_interval_hours(None),
+        )
+        self.assertEqual(
+            1,
+            _MAINTENANCE.normalize_clock_sync_interval_hours(0),
+        )
+        self.assertEqual(
+            168,
+            _MAINTENANCE.normalize_clock_sync_interval_hours(200),
+        )
+        self.assertEqual(
+            timedelta(hours=12),
+            _MAINTENANCE.clock_sync_interval_duration("12"),
+        )
+
 
 class RefreshAttemptTests(unittest.IsolatedAsyncioTestCase):
     """Verify bounded refresh retry behavior."""

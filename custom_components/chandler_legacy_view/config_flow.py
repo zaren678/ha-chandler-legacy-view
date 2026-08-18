@@ -24,6 +24,7 @@ from homeassistant.helpers.selector import (
 )
 
 from .const import (
+    CONF_CLOCK_SYNC_INTERVAL_HOURS,
     CONF_DEFAULT_PASSCODE,
     CONF_DEVICE_ADDRESS,
     CONF_DEVICE_PASSCODE,
@@ -36,9 +37,13 @@ from .const import (
 )
 from .entity import friendly_name_from_advertised_name
 from .maintenance import (
+    DEFAULT_CLOCK_SYNC_INTERVAL_HOURS,
     DEFAULT_WATCHDOG_TIMEOUT_MINUTES,
+    MAX_CLOCK_SYNC_INTERVAL_HOURS,
     MAX_WATCHDOG_TIMEOUT_MINUTES,
+    MIN_CLOCK_SYNC_INTERVAL_HOURS,
     MIN_WATCHDOG_TIMEOUT_MINUTES,
+    normalize_clock_sync_interval_hours,
     normalize_watchdog_timeout_minutes,
 )
 
@@ -150,6 +155,11 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
 
         if user_input is not None:
             updated_options = dict(self._config_entry.options)
+            updated_options[CONF_CLOCK_SYNC_INTERVAL_HOURS] = (
+                normalize_clock_sync_interval_hours(
+                    user_input.get(CONF_CLOCK_SYNC_INTERVAL_HOURS)
+                )
+            )
             updated_options[CONF_WATCHDOG_TIMEOUT_MINUTES] = (
                 normalize_watchdog_timeout_minutes(
                     user_input.get(CONF_WATCHDOG_TIMEOUT_MINUTES)
@@ -235,6 +245,23 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
                     step=5,
                     mode=NumberSelectorMode.BOX,
                     unit_of_measurement="minutes",
+                )
+            ),
+            vol.Optional(
+                CONF_CLOCK_SYNC_INTERVAL_HOURS,
+                default=normalize_clock_sync_interval_hours(
+                    self._config_entry.options.get(
+                        CONF_CLOCK_SYNC_INTERVAL_HOURS,
+                        DEFAULT_CLOCK_SYNC_INTERVAL_HOURS,
+                    )
+                ),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=MIN_CLOCK_SYNC_INTERVAL_HOURS,
+                    max=MAX_CLOCK_SYNC_INTERVAL_HOURS,
+                    step=1,
+                    mode=NumberSelectorMode.BOX,
+                    unit_of_measurement="hours",
                 )
             ),
         }

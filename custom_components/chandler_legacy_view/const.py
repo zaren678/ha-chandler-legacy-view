@@ -15,6 +15,7 @@ CONF_DEVICE_PASSCODES: Final = "device_passcodes"
 CONF_DEVICE_POLL_INTERVALS: Final = "device_poll_intervals"
 CONF_DEVICE_PERSISTENT_CONNECTIONS: Final = "device_persistent_connections"
 CONF_REMOVE_OVERRIDE: Final = "remove_override"
+CONF_CLOCK_SYNC_INTERVAL_HOURS: Final = "clock_sync_interval_hours"
 CONF_WATCHDOG_TIMEOUT_MINUTES: Final = "watchdog_timeout_minutes"
 
 DEFAULT_VALVE_PASSCODE: Final = "1234"

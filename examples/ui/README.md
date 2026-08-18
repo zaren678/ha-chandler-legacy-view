@@ -10,10 +10,11 @@ Each file is a SINGLE dict ready for **Settings → Automations → Create Autom
    - `04_fake_idle_notify.yaml` — notify-only 10m Idle+flow>0.08
    - `05_bluetooth_watchdog.yaml` — `Recovery Required` turns on after the configured timeout + 3 failed Python refreshes → plug off 30s/on, rediscover, refresh
 
-The integration checks the valve clock every six hours and synchronizes it when
-drift exceeds five minutes, so no clock automation is required. After
-installing/reloading the integration, verify the generated `Recovery Required`
-entity ID and adjust automation 05 if Home Assistant chose a different prefix.
+The integration checks the valve clock on its configured interval (six hours by
+default) and synchronizes it when drift exceeds five minutes, so no clock
+automation is required. After installing/reloading the integration, verify the
+generated `Recovery Required` entity ID and adjust automation 05 if Home
+Assistant chose a different prefix.
 
 Why separate? HA UI single-automation YAML expects `alias:` at top level, not `automation:` nor `- alias:` list — pasting the combined list gives `extra keys not allowed @ data['automation']`. These files avoid that.
 

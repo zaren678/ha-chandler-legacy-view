@@ -28,6 +28,7 @@ from homeassistant.util import dt as dt_util
 
 from .clock import create_set_time_payload
 from .const import (
+    CONF_CLOCK_SYNC_INTERVAL_HOURS,
     CONF_DEFAULT_PASSCODE,
     CONF_DEVICE_PASSCODES,
     CONF_DEVICE_PERSISTENT_CONNECTIONS,
@@ -46,11 +47,11 @@ from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
 from .entity import format_firmware_version
 from .firmware import decode_firmware_version, firmware_model
 from .maintenance import (
-    CLOCK_CHECK_INTERVAL,
     CLOCK_DRIFT_LIMIT_MINUTES,
     RECOVERY_REFRESH_ATTEMPTS,
     WATCHDOG_CHECK_INTERVAL,
     clock_drift_minutes,
+    clock_sync_interval_duration,
     dashboard_is_stale,
     run_refresh_attempts,
     watchdog_timeout_duration,
@@ -3643,6 +3644,8 @@ class ValveConnectionManager:
         self._cancel_history_interval: CALLBACK_TYPE | None = None
         self._cancel_recovery_interval: CALLBACK_TYPE | None = None
         self._cancel_clock_interval: CALLBACK_TYPE | None = None
+        self._clock_interval: timedelta | None = None
+        self._remove_options_listener: CALLBACK_TYPE | None = None
         self._startup_unsub: CALLBACK_TYPE | None = None
 
     async def async_setup(self) -> None:
@@ -3674,10 +3677,9 @@ class ValveConnectionManager:
             self._handle_recovery_interval,
             WATCHDOG_CHECK_INTERVAL,
         )
-        self._cancel_clock_interval = async_track_time_interval(
-            self._hass,
-            self._handle_clock_interval,
-            CLOCK_CHECK_INTERVAL,
+        self._reschedule_clock_interval()
+        self._remove_options_listener = self._config_entry.add_update_listener(
+            self._handle_options_update
         )
 
         if self._hass.state != CoreState.running:
@@ -3711,6 +3713,11 @@ class ValveConnectionManager:
         if self._cancel_clock_interval is not None:
             self._cancel_clock_interval()
             self._cancel_clock_interval = None
+        self._clock_interval = None
+
+        if self._remove_options_listener is not None:
+            self._remove_options_listener()
+            self._remove_options_listener = None
 
         if self._startup_unsub is not None:
             self._startup_unsub()
@@ -3761,6 +3768,36 @@ class ValveConnectionManager:
 
         for connection in self._connections.values():
             connection.schedule_clock_check()
+
+    def _reschedule_clock_interval(self) -> None:
+        """Apply the configured clock-maintenance interval."""
+
+        interval = self.get_clock_sync_interval()
+        if self._cancel_clock_interval is not None and interval == self._clock_interval:
+            return
+
+        if self._cancel_clock_interval is not None:
+            self._cancel_clock_interval()
+
+        self._clock_interval = interval
+        self._cancel_clock_interval = async_track_time_interval(
+            self._hass,
+            self._handle_clock_interval,
+            interval,
+        )
+        _LOGGER.debug(
+            "Scheduled valve clock maintenance every %s hours",
+            int(interval.total_seconds() // 3600),
+        )
+
+    async def _handle_options_update(
+        self,
+        _: HomeAssistant,
+        __: ConfigEntry,
+    ) -> None:
+        """Apply scheduler options without reloading the integration."""
+
+        self._reschedule_clock_interval()
 
     async def _handle_home_assistant_started(self, _: object) -> None:
         """Trigger an initial poll once Home Assistant startup completes."""
@@ -3818,6 +3855,13 @@ class ValveConnectionManager:
 
         return watchdog_timeout_duration(
             self._config_entry.options.get(CONF_WATCHDOG_TIMEOUT_MINUTES)
+        )
+
+    def get_clock_sync_interval(self) -> timedelta:
+        """Return the configured valve clock-maintenance interval."""
+
+        return clock_sync_interval_duration(
+            self._config_entry.options.get(CONF_CLOCK_SYNC_INTERVAL_HOURS)
         )
 
     def get_connection(self, address: str) -> ValveConnection | None:

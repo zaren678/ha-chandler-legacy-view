@@ -20,11 +20,12 @@
     "step": {
       "init": {
         "title": "Chandler Legacy View options",
-        "description": "Configure valve access and dashboard recovery behavior.",
+        "description": "Configure valve access, dashboard recovery, and clock maintenance.",
         "data": {
           "default_passcode": "Default valve passcode",
           "watchdog_timeout_minutes": "Recovery timeout",
-          "device_address": "Valve to configure",
+          "clock_sync_interval_hours": "Clock synchronization interval",
+          "device_address": "Valve for passcode override",
           "device_passcode": "Override passcode",
           "remove_override": "Remove override"
         }
